@@ -440,20 +440,19 @@ class RAGEngine:
                 prefix = f"Source ({meta.get('type', 'Unknown')})"
 
             if hasattr(node, 'get_content'):
-                content = node.get_content()
+                content_text = node.get_content()
             else:
-                content = str(node)
+                content_text = str(node)
 
-            context_snippets.append(f"--- [{prefix}: {meta.get('title', 'N/A')}] ---\n{content}")
+            context_snippets.append(f"--- [{prefix}: {meta.get('title', 'N/A')}] ---\n{content_text}")
 
-        context = self._sanitize_context("\n\n".join(context_snippets))
+        context_str = self._sanitize_context("\n\n".join(context_snippets))
 
         arbitration_instruction = ""
         if getattr(self.config, 'ENABLE_ARBITRATION_PROMPT', False):
             arbitration_instruction = "**DISCREPANCY ARBITRATION:** Review the context chunks carefully. PRIORITIZE repository file structures and technical appendices over high-level abstract mentions."
 
         kwargs = {}
-        
 
         for attempt in range(2):
             try:
@@ -462,8 +461,8 @@ class RAGEngine:
                 else:
                     max_len = self.RAG_CELLULAR_FALLBACK_CHARS
 
-                curr_context = context[:max_len]
-                if len(context) > max_len:
+                curr_context = context_str[:max_len]
+                if len(context_str) > max_len:
                     curr_context += "... [TRUNCATED]"
 
                 citation_instruction = ""
@@ -471,11 +470,12 @@ class RAGEngine:
                     citation_instruction = "IMPORTANT: Return the FULL academic citation if available."
 
                 missing_fallback = "Standard version" if "Comments" in field_name else "[missing]"
+                
                 prompt = (
                     f"Query: {base_query}\nTarget Field: {field_name}\nContext:\n{curr_context}\n\n"
                     f"Instructions: Answer strictly based on context. The value MUST be ONLY the raw integer number or concise phrase. Do NOT write conversational sentences. {numeric_instruction} {citation_instruction} {arbitration_instruction} "
                     f"If not found, set value='{missing_fallback}'.\n"
-                    f"Format EXACTLY as raw JSON without markdown blocks: {{"value": "Extracted Text", "confidence": 0.95, "rationale": "Found in context"}}"
+                    f"Format EXACTLY as raw JSON without markdown blocks: {{\"value\": \"Extracted Text\", \"confidence\": 0.95, \"rationale\": \"Found in context\"}}"
                 )
 
                 resp = await self.tools.generate_content_rag_async(prompt, max_new_tokens=256, **kwargs)
@@ -506,7 +506,6 @@ class RAGEngine:
                     return None
 
         return None
-
 
     def _process_rag_results(self, state, results) -> Tuple[int, int, int]:
         fills = 0
