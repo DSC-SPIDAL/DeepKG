@@ -453,11 +453,7 @@ class RAGEngine:
             arbitration_instruction = "**DISCREPANCY ARBITRATION:** Review the context chunks carefully. PRIORITIZE repository file structures and technical appendices over high-level abstract mentions."
 
         kwargs = {}
-        if types and not is_local:
-            try:
-                kwargs["config"] = types.GenerateContentConfig(response_mime_type="application/json")
-            except Exception:
-                pass
+        
 
         for attempt in range(2):
             try:
@@ -474,13 +470,12 @@ class RAGEngine:
                 if "citation" in field_name.lower():
                     citation_instruction = "IMPORTANT: Return the FULL academic citation if available."
 
-                json_example = '{"value": "Extracted Text", "confidence": 0.95, "rationale": "Found in context"}'
-                json_instructions = f"\nFormat EXACTLY as raw JSON. Do NOT wrap in markdown blocks. Example:\n{json_example}\n"
-
+                missing_fallback = "Standard version" if "Comments" in field_name else "[missing]"
                 prompt = (
                     f"Query: {base_query}\nTarget Field: {field_name}\nContext:\n{curr_context}\n\n"
-                    f"Instructions: Answer strictly based on context. {numeric_instruction} {citation_instruction} {arbitration_instruction} "
-                    f"If not found, set value='[missing]'. {json_instructions}"
+                    f"Instructions: Answer strictly based on context. The value MUST be ONLY the raw integer number or concise phrase. Do NOT write conversational sentences. {numeric_instruction} {citation_instruction} {arbitration_instruction} "
+                    f"If not found, set value='{missing_fallback}'.\n"
+                    f"Format EXACTLY as raw JSON without markdown blocks: {{"value": "Extracted Text", "confidence": 0.95, "rationale": "Found in context"}}"
                 )
 
                 resp = await self.tools.generate_content_rag_async(prompt, max_new_tokens=256, **kwargs)
