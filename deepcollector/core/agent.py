@@ -1239,18 +1239,25 @@ class CatalogAgent:
                     inspected.add(name)
 
     def _plan_and_execute_extraction_search(self, gaps):
-        ds_gaps = {}
-        for g in gaps:
-            ds_gaps.setdefault(g['Dataset'], []).append(g['Field'])
-        for ds, fields in list(ds_gaps.items())[:15]:
-            clean_fields = [f.replace(" (C)", "") for f in fields]
+        # Search field-by-field. Mashing them together confuses the search engine.
+        for gap in gaps[:15]:
+            ds = gap['Dataset']
+            field = gap['Field'].replace(" (C)", "")
             eff_name = self.state.get_effective_name(ds)
-            field_str = str(clean_fields).lower()
-            if "url" in field_str or "source" in field_str or "link" in field_str:
+            
+            f_lower = field.lower()
+            if "url" in f_lower or "source" in f_lower or "link" in f_lower:
                 query = f"official download url repository github dataset '{eff_name}'"
+            elif "variable" in f_lower or "feature" in f_lower or "dimension" in f_lower:
+                query = f"how many variables features dimensions in '{eff_name}' dataset"
+            elif "time" in f_lower or "length" in f_lower or "point" in f_lower:
+                query = f"number of time points rows length of '{eff_name}' dataset"
+            elif "location" in f_lower or "series" in f_lower:
+                query = f"number of locations unique series in '{eff_name}' dataset"
             else:
-                query = f"{eff_name} dataset {', '.join(clean_fields)}"
-            print(f"🛠️ Executing Search: {query}")
+                query = f"'{eff_name}' dataset {field}"
+                
+            print(f"🛠️ Executing Targeted Search: {query}")
             res = self.tools.tool_search_and_fetch(query, num_results=getattr(self.config, 'SEARCH_NUM_RESULTS', 8))
             if res:
                 self.state.add_data_and_index(res)
