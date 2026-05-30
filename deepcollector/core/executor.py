@@ -204,7 +204,7 @@ def execute_jobs(mode: str, project_names: list, base_config, gc_client=None, dr
     sys.stderr = sys.stdout
 
     try:
-        print(f"?? Initializing Executor (Mode: {mode})...")
+        print(f"🚀 Initializing Executor (Mode: {mode})...")
         profiler.reset()
 
         if mode == "PLAN":
@@ -229,7 +229,7 @@ def execute_jobs(mode: str, project_names: list, base_config, gc_client=None, dr
             total_projects = len(project_names)
             for i, p_name in enumerate(project_names):
                 print(f"\n{'='*70}")
-                print(f"?? BATCH PROGRESS: [{i+1}/{total_projects}] Processing Project: {p_name}")
+                print(f"🚀 BATCH PROGRESS: [{i+1}/{total_projects}] Processing Project: {p_name}")
                 print(f"{'='*70}")
 
                 current_job_id = f"JOB_{uuid.uuid4().hex[:6].upper()}"
@@ -243,11 +243,11 @@ def execute_jobs(mode: str, project_names: list, base_config, gc_client=None, dr
                 run_mode = mode
 
                 if p_name != "GLOBAL":
-                    print(f"?? Loading Project Context for {p_name}...")
+                    print(f"🔄 Loading Project Context for {p_name}...")
                     loader = ProjectLoader(current_config, gc_client, verbosity=current_config.VERBOSITY_LEVEL)
 
                     if loader.resolve_configuration():
-                        print(f"    ? Context Loaded: '{current_config.PROJECT_CONTEXT[:80]}...'")
+                        print(f"    ✅ Context Loaded: '{current_config.PROJECT_CONTEXT[:80]}...'")
                         if current_config.PROJECT_METHOD == 2 and run_mode == "AGENT":
                             print(f"    ??  Project defines Method 2 in Master Sheet. Switching to HARVEST mode.")
                             run_mode = "HARVEST"
@@ -260,7 +260,7 @@ def execute_jobs(mode: str, project_names: list, base_config, gc_client=None, dr
                     agent.job_id = current_job_id
                     if p_name == "GLOBAL": agent.config.CURRENT_PROJECT_ID = "GLOBAL"
                     agent.execute_workflow(mode=run_mode, job_comment=job_comment, merge_dry_run=dry_run)
-                    print(f"\n?? Successfully finished [{i+1}/{total_projects}]: {p_name}")
+                    print(f"\n🎉 Successfully finished [{i+1}/{total_projects}]: {p_name}")
                 except Exception as e:
                     print(f"\n? Error processing {p_name}: {e}")
                     print("?? Catching error and safely continuing to next project in queue...")
@@ -269,11 +269,11 @@ def execute_jobs(mode: str, project_names: list, base_config, gc_client=None, dr
                     print("? Pausing for 5 seconds before next project...")
                     time.sleep(5)
 
-            print(f"\n{'='*70}\n?? BATCH PROCESSING COMPLETE. Processed {total_projects} items.\n{'='*70}")
+            print(f"\n{'='*70}\n🏁 BATCH PROCESSING COMPLETE. Processed {total_projects} items.\n{'='*70}")
 
         if mode != "PLAN":
             print("\n" + "="*40)
-            print("?? OVERALL PROFILING & HEALTH REPORT")
+            print("⏱️ OVERALL PROFILING & HEALTH REPORT")
             print("="*40)
             try:
                 df_profile = profiler.get_report()
@@ -289,7 +289,7 @@ def execute_jobs(mode: str, project_names: list, base_config, gc_client=None, dr
         # Upload Log to Google Drive
         log_folder_id = getattr(base_config, 'GOOGLE_DRIVE_LOG_FOLDER_ID', None)
         if log_folder_id:
-            print(f"\n?? Uploading Console Log ({log_filename}) to Google Drive...")
+            print(f"\n☁️ Uploading Console Log ({log_filename}) to Google Drive...")
             try:
                 from googleapiclient.discovery import build
                 from google.auth import default
@@ -301,7 +301,7 @@ def execute_jobs(mode: str, project_names: list, base_config, gc_client=None, dr
                 file_metadata = {'name': log_filename, 'parents': [log_folder_id]}
                 media = MediaFileUpload(log_filename, mimetype='text/plain')
                 file = drive_service.files().create(body=file_metadata, media_body=media, fields='id').execute()
-                print(f"? Success! Log File uploaded to Drive with ID: {file.get('id')}")
+                print(f"✅ Success! Log File uploaded to Drive with ID: {file.get('id')}")
             except ImportError:
                 print("?? googleapiclient not installed. Skipping Drive upload.")
             except Exception as e:

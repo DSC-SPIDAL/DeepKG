@@ -362,7 +362,7 @@ class DeepResearchRunner:
                     raw_name = self._clean_text(row.get("Dataset Name", ""))
                     if not raw_name or "---" in raw_name: continue
 
-                    item = {"Dataset Name": {"value": raw_name, "confidence": 0.70, "telemetry_context": "Deep Research"}}
+                    item = {"Dataset Name": {"value": raw_name, "confidence": 0.85, "telemetry_context": "Deep Research"}}
 
                     for dr_col, schema_col in col_map.items():
                         matched_key = next((k for k in row.keys() if dr_col in k), None)
@@ -377,7 +377,7 @@ class DeepResearchRunner:
                                     if "collection" in val.lower() or "archive" in val.lower(): val = "Collection"
                                     elif "provider" in val.lower(): val = "Provider"
                                     else: val = "Dataset"
-                                item[schema_col] = {"value": val, "confidence": 0.70, "telemetry_context": "Deep Research"}
+                                item[schema_col] = {"value": val, "confidence": 0.85, "telemetry_context": "Deep Research"}
 
                     item["Assignment Confidence"] = {"value": "0.80", "confidence": 1.0}
                     item["Assignment Rationale"] = {"value": "Identified by Deep Research Agent", "confidence": 1.0}

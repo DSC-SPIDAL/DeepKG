@@ -648,7 +648,7 @@ class CatalogAgent:
                     kb_col = schema_mapping.get(cat_field, cat_field)
                     val = str(row.get(kb_col, "[missing]")).strip()
 
-                    if val and val.lower() not in ["nan", "none", ""] and val not in self.kb_manager.MISSING_DATA_PLACEHOLDERS:
+                    if val and val.lower() not in ["nan", "none", "", "[skipped]"] and val not in self.kb_manager.MISSING_DATA_PLACEHOLDERS:
                         self.state.update_cell_data(name, cat_field, {"value": val, "confidence": 1.0, "telemetry_context": "KB Golden Fast-Path"})
                         hydrated = True
                         skipped_fields_total += 1
