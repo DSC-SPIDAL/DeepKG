@@ -1,0 +1,36 @@
+#!/bin/bash
+
+echo "========================================================"
+echo "🔄 INITIALIZING BULLETPROOF GITHUB SYNC"
+echo "========================================================"
+
+# 1. Dynamically hunt for the .git root directory
+if [ -d ".git" ]; then
+    GIT_ROOT=$(pwd)
+elif [ -d "../.git" ]; then
+    GIT_ROOT=$(dirname $(pwd))
+elif [ -d "../../.git" ]; then
+    GIT_ROOT=$(dirname $(dirname $(pwd)))
+elif [ -d "deepcollector/.git" ]; then
+    GIT_ROOT="$(pwd)/deepcollector"
+else
+    echo "❌ ERROR: Cannot find the hidden .git directory!"
+    exit 1
+fi
+
+echo "📍 Anchoring execution to Git root: $GIT_ROOT"
+cd "$GIT_ROOT" || exit 1
+
+echo "🖥️ Staging code changes for Git (excluding data files)..."
+# Add your specific filetypes to avoid staging massive CSVs if .gitignore fails
+git add \*.py \*.sh \*.json \*.md \*.ipynb
+
+echo "📝 Committing changes..."
+git commit -m "Auto-update local DGX scripts - $(date +'%Y-%m-%d %H:%M')"
+
+echo "🚀 Pushing updates to GitHub..."
+git push
+
+echo "========================================================"
+echo "✅ GITHUB UPDATE SUCCESSFUL"
+echo "========================================================"

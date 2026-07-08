@@ -1,0 +1,16 @@
+# Block Secrets
+credentials.json
+token.json
+client_secret.json
+*.json
+
+# Block Data & Logs
+*.csv
+*.log
+*.txt
+*.zip
+
+# Block Local Storage Folders
+Trash/
+Trash_Bin/
+Cleaned_Paper_Data/

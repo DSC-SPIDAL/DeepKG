@@ -1,0 +1,42 @@
+#!/bin/bash
+# DeepCollector DGX to GitHub Sync Script (Revised)
+
+# Define your paths
+WORKSPACE_DIR="$HOME/Desktop/DeepKG"
+REPO_DIR="$WORKSPACE_DIR/deepcollector"
+
+echo "========================================================"
+echo "🔄 INITIALIZING GITHUB SYNC DIRECTLY FROM LOCALDGXFILES"
+echo "========================================================"
+
+# 1. Ensure the Git repository exists
+if [ ! -d "$REPO_DIR" ]; then
+    echo "❌ Error: Git repository directory $REPO_DIR not found."
+    exit 1
+fi
+
+# 2. Navigate into the Git Repository
+cd "$REPO_DIR" || exit 1
+
+# 3. Stage ONLY the localdgxfiles directory
+echo -e "\n🖥️ Staging changes for Git..."
+git add "localdgxfiles/"
+
+# 4. Check if there are actual changes to commit
+if git diff-index --quiet HEAD --; then
+    echo "ℹ️ No changes detected. GitHub is already up to date."
+else
+    # Create a dynamic timestamp for the commit message
+    TIMESTAMP=$(date +"%Y-%m-%d %H:%M")
+    COMMIT_MSG="Auto-update local DGX scripts - $TIMESTAMP"
+    
+    echo "📝 Committing changes: '$COMMIT_MSG'"
+    git commit -m "$COMMIT_MSG"
+    
+    echo "🚀 Pushing updates to GitHub..."
+    git push origin main 
+    
+    echo -e "\n========================================================"
+    echo "✅ GITHUB UPDATE SUCCESSFUL"
+    echo "========================================================"
+fi
