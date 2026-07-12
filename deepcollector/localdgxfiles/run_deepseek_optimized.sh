@@ -38,7 +38,7 @@ echo -e "\n✅ vLLM is Ready!"
 
 # 2. Export reasoning parameters for DeepSeek
 export DC_TEMP="0.6"
-export DC_TOKENS="8192"
+export DC_TOKENS="1024"
 export DEEPCOLLECTOR_USE_VLLM="True"
 
 echo "🔥 Launching DeepCollector..."

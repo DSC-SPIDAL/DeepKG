@@ -169,7 +169,11 @@ if hasattr(CatalogAgent, '_export_run_data') and not getattr(CatalogAgent, '_exp
             df.insert(1, "Benchmark_Model", safe_model)
             safe_proj_name = re.sub(r'[^A-Za-z0-9_\-]', '_', proj_name).strip('_')
             timestamp = time.strftime('%Y%m%d_%H%M')
-            filename = f"Bench_{safe_proj_name}_{safe_model}_{timestamp}.csv"
+            prefix = os.environ.get("DC_FILE_PREFIX")
+            if prefix:
+                filename = f"{prefix}_Data.csv"
+            else:
+                filename = f"{os.environ.get('DC_FILE_PREFIX')}_Data.csv" if os.environ.get("DC_FILE_PREFIX") else f"Bench_{safe_proj_name}_{safe_model}_{timestamp}.csv"
             
             # Use COLAB_OUTPUT_DIR if available
             out_dir = os.environ.get("COLAB_OUTPUT_DIR", "")
@@ -192,7 +196,11 @@ if hasattr(CatalogAgent, 'run_workflow') and not getattr(CatalogAgent, '_workflo
             safe_model = MODEL_ID.split('/')[-1]
             safe_proj_name = re.sub(r'[^A-Za-z0-9_\-]', '_', proj_name).strip('_')
             timestamp = time.strftime('%Y%m%d_%H%M')
-            filename = f"Bench_{safe_proj_name}_{safe_model}_{timestamp}.csv"
+            prefix = os.environ.get("DC_FILE_PREFIX")
+            if prefix:
+                filename = f"{prefix}_Data.csv"
+            else:
+                filename = f"{os.environ.get('DC_FILE_PREFIX')}_Data.csv" if os.environ.get("DC_FILE_PREFIX") else f"Bench_{safe_proj_name}_{safe_model}_{timestamp}.csv"
             
             out_dir = os.environ.get("COLAB_OUTPUT_DIR", "")
             if out_dir:

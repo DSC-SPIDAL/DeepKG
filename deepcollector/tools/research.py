@@ -111,7 +111,13 @@ class ResearchTools:
 
         if url.startswith('/content/drive/'):
             try:
-                if self.verbosity >= 2: print(f"    📁 [Local Fetch] Reading {url} directly from Drive...")
+                import os
+                # Map Colab path to local DGX path
+                if "PDFGems" in url:
+                    filename = os.path.basename(url)
+                    url = os.path.expanduser(f"~/Desktop/DeepKG/PDFGems/{filename}")
+                    
+                if self.verbosity >= 2: print(f"    📁 [Local Fetch] Reading {url} directly from local disk...")
                 with open(url, 'rb') as f:
                     content = f.read()
                 content_type = 'application/pdf' if url.lower().endswith('.pdf') else 'text/plain'

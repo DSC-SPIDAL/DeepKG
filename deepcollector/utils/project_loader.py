@@ -63,7 +63,7 @@ class ExternalKnowledge:
             data = self._fetch_sheet_data()
 
             if data and len(data) > 1:
-                self.headers = [str(h).strip() for h in data]
+                self.headers = [str(h).strip() for h in data[0]]
                 self.projects = [dict(zip(self.headers, row)) for row in data[1:]]
                 if self.verbosity >= 1:
                     print(f"    ✅ [ExternalKnowledge] Loaded {len(self.projects)} records.")

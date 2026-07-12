@@ -1,10 +1,11 @@
 #!/bin/bash
-# DeepSeek 131K Titan: Isolated Re-run
-export DC_TEMP="0.6"
-export DC_TOKENS="8192"
 
+# Define the remaining benchmark matrix with the correct model keys
 JOBS=(
+    "gemma4 UTSD"
     "deepseek UTSD"
+    "qwen LOTSA"
+    "gemma4 LOTSA"
     "deepseek LOTSA"
 )
 
@@ -12,12 +13,13 @@ CONTEXT="131072"
 CONCURRENCY="1"
 
 echo "========================================================"
-echo "🚀 INITIALIZING TITAN ABLATION SUITE (DeepSeek 131K ONLY)"
+echo "🚀 INITIALIZING CORRECTED TITAN ABLATION SUITE (131K)"
 echo "========================================================"
 
 for JOB in "${JOBS[@]}"; do
     read -r MODEL DATASET <<< "$JOB"
     
+    # Keep the log names clean but use the correct model variable for execution
     LOG_FILE="Titan_${MODEL}_${DATASET}_128K.log"
     VRAM_CSV="vram_${MODEL}_${DATASET}.csv"
     
@@ -76,5 +78,5 @@ for JOB in "${JOBS[@]}"; do
 done
 
 echo -e "\n========================================================"
-echo "✅ DEEPSEEK TITAN RUNS COMPLETE"
+echo "✅ ALL MATRIX RUNS COMPLETE"
 echo "========================================================"

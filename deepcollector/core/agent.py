@@ -411,7 +411,12 @@ class CatalogAgent:
         try:
             df = self.get_catalog_report(full_details=False)
             if not df.empty:
-                filename = f"checkpoint_{self.config.CURRENT_PROJECT_ID}_{self.job_id}.csv"
+                prefix = os.environ.get("DC_FILE_PREFIX")
+                if prefix:
+                    safe_phase = phase_name.replace(" ", "_").replace(":", "")
+                    filename = f"{prefix}_Checkpoint_{safe_phase}.csv"
+                else:
+                    filename = f"{os.environ.get('DC_FILE_PREFIX')}_Checkpoint_{phase_name.replace(' ', '_').replace(':', '')}.csv" if os.environ.get("DC_FILE_PREFIX") else f"checkpoint_{self.config.CURRENT_PROJECT_ID}_{self.job_id}.csv"
                 df.to_csv(filename, index=False)
                 if self.verbosity >= 2:
                     print(f"    💾 Auto-Checkpoint saved to {filename} ({phase_name})")
