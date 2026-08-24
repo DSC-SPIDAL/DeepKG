@@ -84,6 +84,10 @@ class CatalogState:
 
         # 🧠 FIX: Search Memory prevents infinite RAG extraction loops
         self.past_searches: set = set()
+        
+        # 🐞 JSON Parsing Error Tracker
+        self.json_attempts: int = 0
+        self.json_parse_errors: int = 0
 
         self.bm25_retriever: Optional[Any] = None
         self.BM25RetrieverClass = getattr(config, 'BM25Retriever', None)

@@ -173,17 +173,12 @@ def initialize_apis(config: Any) -> Tuple[Dict[str, str], Any]:
 
         candidates_pro = [
             "gemini-3.1-pro-preview",
-            "gemini-3-pro-preview",
-            "gemini-2.5-pro",
-            "gemini-pro-latest"
+            "gemini-2.5-pro"
         ]
 
         candidates_flash = [
             "gemini-3.5-flash",
-            "gemini-3-flash-preview",
-            "gemini-2.5-flash",
-            "gemini-2.0-flash",
-            "gemini-2.0-flash-lite"
+            "gemini-2.5-flash"
         ]
 
         def verify_pool(model_list, pool_name):
@@ -197,7 +192,10 @@ def initialize_apis(config: Any) -> Tuple[Dict[str, str], Any]:
                     verified.append(model)
                 except Exception as e:
                     err_str = str(e).lower()
-                    if "404" in err_str or "not found" in err_str:
+                    if "429" in err_str or "quota" in err_str:
+                        print(f"       ⚠️ {model} hit rate limit during verify, but adding to pool anyway.")
+                        verified.append(model)
+                    elif "404" in err_str or "not found" in err_str:
                         print(f"       ⚠️ Skipping {model}: Model deprecated or not found (404).")
                     else:
                         print(f"       ⚠️ Skipping {model}: API access error -> {e}")

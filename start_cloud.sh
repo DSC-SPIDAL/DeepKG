@@ -6,17 +6,17 @@
 # =============================================================================
 
 echo "🔄 Checking Git Repository Status..."
-if [ -d "/home/geoffrey/Desktop/DeepKG/.git" ]; then
-    echo "    ✅ Valid Git repository detected. Pulling latest changes..."
-    cd /home/geoffrey/Desktop/DeepKG
-    git pull origin main
-else
-    echo "    ⚠️ Not a git repository. Backing up and cloning fresh..."
-    mv /home/geoffrey/Desktop/DeepKG /home/geoffrey/Desktop/DeepKG_backup_$(date +%s)
-    cd /home/geoffrey/Desktop
-    git clone https://github.com/DSC-SPIDAL/DeepKG.git
-    cd DeepKG
-fi
+#if [ -d "/home/geoffrey/Desktop/DeepKG/.git" ]; then
+#    echo "    ✅ Valid Git repository detected. Pulling latest changes..."
+#    cd /home/geoffrey/Desktop/DeepKG
+#    git pull origin main
+#else
+#    echo "    ⚠️ Not a git repository. Backing up and cloning fresh..."
+#    mv /home/geoffrey/Desktop/DeepKG /home/geoffrey/Desktop/DeepKG_backup_$(date +%s)
+#    cd /home/geoffrey/Desktop
+#    git clone https://github.com/DSC-SPIDAL/DeepKG.git
+#    cd DeepKG
+#fi
 
 # --- 1. SECRETS & CREDENTIALS (SECURE LOAD) ---
 export GOOGLE_APPLICATION_CREDENTIALS="/home/geoffrey/Desktop/DeepKG/credentials.json"
@@ -45,7 +45,16 @@ export DEEPCOLLECTOR_SEARCH_BACKEND="GEMINI"
 export DEEPCOLLECTOR_SEARXNG_URL=""
 
 # --- 3. PIPELINE EXECUTION ---
-echo "🚀 Starting DeepCollector on DGX (Cloud Mode)..."
-python3 run_cloudagent.py
+echo "☁️ Enforcing Cloud Architecture..."
+export BENCHMARK_MODE="CLOUD"
+export DEEPCOLLECTOR_USE_VLLM="False"
+export DEEPCOLLECTOR_LLM_BACKEND="GEMINI"
+export DEEPCOLLECTOR_SEARCH_BACKEND="GEMINI"
 
-echo "✅ Cloud Run complete."
+# Target OpenAI sol
+export TARGET_PROVIDER="OPENAI"
+export TARGET_MODEL="gpt-5.6-sol"
+export TARGET_PROJECT="${TARGET_PROJECT:-LOTSA}"
+
+echo "🚀 Starting DeepCollector on DGX (Target: $TARGET_PROJECT)..."
+python3 run_agent.py --mode AGENT --project $TARGET_PROJECT

@@ -292,10 +292,20 @@ class RAGEngine:
         return fills, refinements, confirmed
 
     async def _run_rag_batches(self, state, candidate_cells, retriever):
+        import os
         results = []
         total_cells = len(candidate_cells)
         is_local = getattr(self.config, 'LLM_BACKEND', '') in ["LOCAL_PRO", "LOCAL_CLASSROOM"]
-        batch_size = 1 if is_local else self.CELLULAR_RAG_BATCH_SIZE
+        use_vllm = getattr(self.config, 'USE_vLLM', False) or os.environ.get("DEEPCOLLECTOR_USE_VLLM", "False") == "True"
+        
+        if is_local and use_vllm:
+            batch_size = int(os.environ.get("VLLM_CONCURRENCY", self.CELLULAR_RAG_BATCH_SIZE))
+        elif is_local:
+            batch_size = 1
+        else:
+            provider = os.environ.get("TARGET_PROVIDER", "GEMINI")
+            if provider in ["ANTHROPIC", "OPENAI", "XAI"]: batch_size = 5
+            else: batch_size = self.CELLULAR_RAG_BATCH_SIZE
 
         for i in range(0, total_cells, batch_size):
             batch = candidate_cells[i:i+batch_size]
@@ -325,13 +335,14 @@ class RAGEngine:
                     field_name=field_name,
                     query_template=query_template,
                     verified_url=verified_url,
-                    retriever=retriever
+                    retriever=retriever,
+                    state=state
                 )
                 tasks.append(task)
                 valid_batch.append(cell_info)
 
             batch_results = []
-            if is_local:
+            if is_local and not use_vllm:
                 import torch
                 for t in tasks:
                     try:
@@ -381,7 +392,8 @@ class RAGEngine:
         wrapped_tasks = [semaphore_wrapper(task) for task in tasks]
         return await asyncio.gather(*wrapped_tasks, return_exceptions=True)
 
-    async def _extract_cell_data_rag(self, dataset_name, effective_name, field_name, query_template, verified_url, retriever) -> Optional[RAGResult]:
+    async def _extract_cell_data_rag(self, dataset_name, effective_name, field_name, query_template, verified_url, retriever, state=None) -> Optional[RAGResult]:
+        if state is not None: state.json_attempts += 1
         is_local = getattr(self.config, 'LLM_BACKEND', '') in ["LOCAL_PRO", "LOCAL_CLASSROOM"]
         base_query = query_template.format(name=effective_name)
         queries = [base_query]
@@ -480,19 +492,14 @@ class RAGEngine:
                     f"Format EXACTLY as raw JSON without markdown blocks: {{\"value\": \"Extracted Text\", \"confidence\": 0.95, \"rationale\": \"Found in context\"}}"
                 )
 
-                # 🔥 FIX 3: Dynamic Cellular Extraction Tokens
                 extraction_limit = getattr(self.config, 'RAG_MAX_NEW_TOKENS', 512)
-                resp = await self.tools.generate_content_rag_async(prompt, max_new_tokens=extraction_limit, **kwargs)
+                resp = await self.tools.generate_content_rag_async(prompt, max_new_tokens=extraction_limit, force_json=True, **kwargs)
 
-                if not resp or not resp.text:
-                    raise ValueError("Empty response")
-
-                if resp.text in ["[missing]", "{}", "[]"]:
-                    if attempt == 1:
-                        return None
+                if not resp or not resp.text or resp.text in ["[missing]", "{}", "[]"]:
+                    if attempt == 1: return None
                     continue
 
-                val, conf, rat = self._parse_response(resp.text, True, field_name)
+                val, conf, rat = self._parse_response(resp.text, True, field_name, state)
 
                 is_plausible, reason = self._validate_plausibility(field_name, val)
 
@@ -550,11 +557,13 @@ class RAGEngine:
         return fills, refinements, confirmed
 
 
-    def _parse_response(self, text, is_json, field_name=""):
+    def _parse_response(self, text, is_json, field_name="", state=None):
         text = self._clean_json_text(text)
         val = "[missing]"
         conf = 0.0
         rat = "JSON Parse Error"
+        
+        parse_success = False
 
         if is_json:
             data = self.tools._extract_json_robustly(text)
@@ -576,17 +585,23 @@ class RAGEngine:
 
                 conf = min(conf, 1.0)
                 rat = data.get('rationale', '')
+                parse_success = True
             else:
                 val_match = re.search(r'"value"\s*:\s*"([^"]+)"', text, re.I)
                 c_match = re.search(r'"confidence"\s*:\s*([\d.]+)', text, re.IGNORECASE)
 
                 if val_match:
                     val = val_match.group(1).strip()
+                    rat = "Regex Recovery"
+                    parse_success = True
                 if c_match:
                     try:
                         conf = min(float(c_match.group(1)), 1.0)
                     except:
                         pass
+                        
+        if not parse_success and state is not None:
+            state.json_parse_errors += 1
 
         val = str(val).strip()
         if val.startswith("['") and val.endswith("']"):

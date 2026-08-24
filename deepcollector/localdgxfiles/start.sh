@@ -1,6 +1,6 @@
 #!/bin/bash
 # Usage: ./start.sh [model] [context_size] [concurrency] [project]
-# Models: cloud, gemma4, gemma2, qwen, deepseek
+# Models: cloud, gemma4, gemma2, qwen, deepseek, llama3, command-r
 
 MODEL_CHOICE=${1:-gemma4}
 export LOCAL_MAX_CONTEXT=${2:-32768}   # Default to 32k context
@@ -8,6 +8,7 @@ export VLLM_CONCURRENCY=${3:-16}       # Default to 16 parallel tasks
 export TARGET_PROJECT=${4:-LOTSA}      # Default to LOTSA
 
 export BENCHMARK_MODE="LOCAL"
+export TP_SIZE=4 # Default for massive models
 
 if [ "$MODEL_CHOICE" == "cloud" ]; then
     export BENCHMARK_MODE="CLOUD"
@@ -22,6 +23,11 @@ elif [ "$MODEL_CHOICE" == "deepseek" ]; then
     export LOCAL_MODEL_ID="deepseek-ai/DeepSeek-R1-Distill-Qwen-32B"
 elif [ "$MODEL_CHOICE" == "gemma4" ]; then
     export LOCAL_MODEL_ID="google/gemma-4-31b-it" 
+elif [ "$MODEL_CHOICE" == "llama3" ]; then
+    export LOCAL_MODEL_ID="meta-llama/Llama-3.3-70B-Instruct"
+elif [ "$MODEL_CHOICE" == "command-r" ]; then
+    export LOCAL_MODEL_ID="CohereForAI/c4ai-command-r-08-2024"
+    export TP_SIZE=2
 else
     echo "❌ Unknown model choice."
     exit 1
@@ -50,13 +56,15 @@ pkill -9 -f run_agent.py >/dev/null 2>&1 || true
 rm -rf /dev/shm/vllm* /dev/shm/nccl* /dev/shm/core* 2>/dev/null
 
 if [ "$BENCHMARK_MODE" == "LOCAL" ]; then
-    # 🔥 FIX: Added --enforce-eager to bypass CUDA graph deadlocks
-    DOCKER_ARGS=(--model "$LOCAL_MODEL_ID" --tensor-parallel-size 4 --max-model-len "$LOCAL_MAX_CONTEXT" --enable-prefix-caching --gpu-memory-utilization 0.95 --trust-remote-code --enforce-eager)
+    # Dynamic TP_SIZE injected here
+    DOCKER_ARGS=(--model "$LOCAL_MODEL_ID" --tensor-parallel-size "$TP_SIZE" --max-model-len "$LOCAL_MAX_CONTEXT" --enable-prefix-caching --gpu-memory-utilization 0.95 --trust-remote-code --enforce-eager)
     
     if [ "$MODEL_CHOICE" == "gemma2" ]; then DOCKER_ARGS+=( --rope-scaling '{"type":"dynamic","factor":16.0}' ); fi
 
-    echo "🧠 Starting vLLM ($LOCAL_MODEL_ID) | Context: $LOCAL_MAX_CONTEXT | Concurrency: $VLLM_CONCURRENCY..."
-    docker run -e VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 -d --name vllm_engine --gpus all --shm-size 32g -e NVIDIA_VISIBLE_DEVICES="0,1,2,4" -e HF_TOKEN="$HF_TOKEN" -v /home/geoffrey/.cache/huggingface:/root/.cache/huggingface -p 8000:8000 --ipc=host vllm/vllm-openai:latest "${DOCKER_ARGS[@]}" > /dev/null
+    echo "🧠 Starting vLLM ($LOCAL_MODEL_ID) | Context: $LOCAL_MAX_CONTEXT | Concurrency: $VLLM_CONCURRENCY | TP: $TP_SIZE..."
+    
+    # Cache mount explicitly pointed to /raid/huggingface_cache
+    docker run -e VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 -d --name vllm_engine --gpus all --shm-size 32g -e NVIDIA_VISIBLE_DEVICES="0,1,2,4" -e HF_TOKEN="$HF_TOKEN" -v /raid/huggingface_cache:/root/.cache/huggingface -p 8000:8000 --ipc=host vllm/vllm-openai:latest "${DOCKER_ARGS[@]}" > /dev/null
 
     echo -n "⏳ Waiting for vLLM to load weights "
     while [ "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8000/health)" != "200" ]; do 

@@ -175,6 +175,8 @@ class AppConfig:
     PdfReader: Optional[Any] = None
     BM25Retriever: Optional[Any] = None
     UCIMLREPO_AVAILABLE: bool = False
+    BENCHMARK_MODE: str = os.environ.get("BENCHMARK_MODE", "")
+    APPLY_AMNESIA: bool = os.environ.get("APPLY_AMNESIA", "False") == "True"
 
     EXECUTION_ARCHITECTURE: str = field(init=False, default="UNKNOWN")
     GOOGLE_SHEET_KB_ID: Optional[str] = field(init=False, default=None)

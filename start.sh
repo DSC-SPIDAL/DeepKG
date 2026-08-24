@@ -1,13 +1,13 @@
 #!/bin/bash
 # Usage: ./start.sh [model] [context_size] [concurrency] [project]
-# Models: cloud, gemma4, gemma2, qwen, deepseek
 
 MODEL_CHOICE=${1:-gemma4}
-export LOCAL_MAX_CONTEXT=${2:-32768}   # Default to 32k context
-export VLLM_CONCURRENCY=${3:-16}       # Default to 16 parallel tasks
-export TARGET_PROJECT=${4:-LOTSA}      # Default to LOTSA
+export LOCAL_MAX_CONTEXT=${2:-32768}
+export VLLM_CONCURRENCY=${3:-16}
+export TARGET_PROJECT=${4:-LOTSA}
 
 export BENCHMARK_MODE="LOCAL"
+export TP_SIZE=4
 
 if [ "$MODEL_CHOICE" == "cloud" ]; then
     export BENCHMARK_MODE="CLOUD"
@@ -22,6 +22,11 @@ elif [ "$MODEL_CHOICE" == "deepseek" ]; then
     export LOCAL_MODEL_ID="deepseek-ai/DeepSeek-R1-Distill-Qwen-32B"
 elif [ "$MODEL_CHOICE" == "gemma4" ]; then
     export LOCAL_MODEL_ID="google/gemma-4-31b-it" 
+elif [ "$MODEL_CHOICE" == "llama3" ]; then
+    export LOCAL_MODEL_ID="meta-llama/Llama-3.3-70B-Instruct"
+elif [ "$MODEL_CHOICE" == "command-r" ]; then
+    export LOCAL_MODEL_ID="CohereForAI/c4ai-command-r-08-2024"
+    export TP_SIZE=2
 else
     echo "❌ Unknown model choice."
     exit 1
@@ -44,32 +49,46 @@ if [ -f ".env" ]; then source .env; else exit 1; fi
 export KB_SHEET_ID="1-PuWrHO30E4WPM-rOed03n42gfo5AlEtscKqqtjznA0"
 export PROJECT_LIST_ID="1gJ6oHZj0NzCHNOeFNyJTBTtlmS0b7gBSHF3iOqJrFwE"
 
-# 🔥 HARD RESET: Kill containers and wipe corrupted Inter-Process Communication (IPC) memory
 docker rm -f vllm_engine >/dev/null 2>&1
 pkill -9 -f run_agent.py >/dev/null 2>&1 || true
 rm -rf /dev/shm/vllm* /dev/shm/nccl* /dev/shm/core* 2>/dev/null
 
 if [ "$BENCHMARK_MODE" == "LOCAL" ]; then
-    # 🔥 FIX: Added --enforce-eager to bypass CUDA graph deadlocks
-    DOCKER_ARGS=(--model "$LOCAL_MODEL_ID" --tensor-parallel-size 4 --max-model-len "$LOCAL_MAX_CONTEXT" --enable-prefix-caching --gpu-memory-utilization 0.95 --trust-remote-code --enforce-eager)
+    # 🔥 vLLM MEMORY FIX: Lower GPU util for 131K contexts so NCCL doesn't deadlock
+    MEM_UTIL="0.95"
+    if [ "$LOCAL_MAX_CONTEXT" == "131072" ]; then MEM_UTIL="0.85"; fi
+
+    DOCKER_ARGS=(--model "$LOCAL_MODEL_ID" --tensor-parallel-size "$TP_SIZE" --max-model-len "$LOCAL_MAX_CONTEXT" --enable-prefix-caching --gpu-memory-utilization "$MEM_UTIL" --trust-remote-code --enforce-eager)
     
     if [ "$MODEL_CHOICE" == "gemma2" ]; then DOCKER_ARGS+=( --rope-scaling '{"type":"dynamic","factor":16.0}' ); fi
 
-    echo "🧠 Starting vLLM ($LOCAL_MODEL_ID) | Context: $LOCAL_MAX_CONTEXT | Concurrency: $VLLM_CONCURRENCY..."
-    docker run -e VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 -d --name vllm_engine --gpus all --shm-size 32g -e NVIDIA_VISIBLE_DEVICES="0,1,2,4" -e HF_TOKEN="$HF_TOKEN" -v /home/geoffrey/.cache/huggingface:/root/.cache/huggingface -p 8000:8000 --ipc=host vllm/vllm-openai:latest "${DOCKER_ARGS[@]}" > /dev/null
+    echo "🧠 Starting vLLM ($LOCAL_MODEL_ID) | Context: $LOCAL_MAX_CONTEXT | Concurrency: $VLLM_CONCURRENCY | TP: $TP_SIZE..."
+    
+    docker run -e VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 -d --name vllm_engine --gpus all --shm-size 32g -e NVIDIA_VISIBLE_DEVICES="0,1,2,4" -e HF_TOKEN="$HF_TOKEN" -v /raid/huggingface_cache:/root/.cache/huggingface -p 8000:8000 --ipc=host vllm/vllm-openai:latest "${DOCKER_ARGS[@]}" > /dev/null
 
+    # 🔥 vLLM TIMEOUT FIX: Kill if weights fail to load in 15 minutes
+    MAX_WAIT=180 
+    WAITED=0
+    
     echo -n "⏳ Waiting for vLLM to load weights "
     while [ "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8000/health)" != "200" ]; do 
         if [ "$(docker inspect -f '{{.State.Running}}' vllm_engine 2>/dev/null)" == "false" ]; then
-            echo -e "\n\n❌ [FATAL] vLLM Docker container crashed! (Try lowering Context or Concurrency)."
+            echo -e "\n\n❌ [FATAL] vLLM Docker container crashed!"
             docker logs vllm_engine | tail -n 25
             exit 1
         fi
+        
+        WAITED=$((WAITED + 1))
+        if [ $WAITED -ge $MAX_WAIT ]; then
+            echo -e "\n\n❌ [TIMEOUT] vLLM hung for 15 minutes loading weights. System out of contiguous memory."
+            docker rm -f vllm_engine >/dev/null 2>&1
+            exit 1
+        fi
+        
         echo -n "."
         sleep 5
     done
     echo -e "\n✅ vLLM is Ready!"
-    echo "📦 Injecting dependencies (arxiv/pypdf) into container..."
     docker exec vllm_engine pip install arxiv pypdf
 fi
 

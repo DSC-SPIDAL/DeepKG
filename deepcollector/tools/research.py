@@ -379,6 +379,28 @@ class ResearchTools:
         return []
 
     def tool_load_url(self, url: str) -> List[Dict[str, str]]:
+        if isinstance(url, str) and "arxiv.org" in url:
+            match = re.search(r'(\d{4}\.\d{4,5}(v\d+)?|[a-z\-]+/\d{7})', url)
+            if match:
+                paper_id = match.group(1)
+                if self.verbosity >= 1: print(f"\n   📥 [ArXiv Interceptor] Identified {paper_id}. Pulling binary PDF directly...")
+                try:
+                    import requests
+                    import io
+                    import pypdf
+                    target_url = f"https://arxiv.org/pdf/{paper_id}.pdf"
+                    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+                    response = requests.get(target_url, headers=headers, timeout=30)
+                    if response.status_code == 200:
+                        text = ""
+                        pdf_reader = pypdf.PdfReader(io.BytesIO(response.content))
+                        for page in pdf_reader.pages[:50]: 
+                            text += (page.extract_text() or "") + "\n"
+                        if text and len(text.split()) >= 15:
+                            return [{"url": url, "content": text, "title": f"ArXiv Paper {paper_id}", "type": "Direct Load"}]
+                except Exception as e:
+                    pass
+
         try:
             content = self._fetch_page_content(url)
             if content and len(content.split()) >= 15:
@@ -398,7 +420,74 @@ class ResearchTools:
             return {"status": "skipped", "error": f"DDI Tool missing: {e}"}
 
     def _generate_content_local(self, prompt: str, **kwargs):
-        """COLAB ARCHIVAL: Pure Native PyTorch 4-Bit Waterfall."""
+        is_vllm = getattr(self.config, 'USE_vLLM', False) or os.environ.get("DEEPCOLLECTOR_USE_VLLM", "False") == "True"
+        if is_vllm:
+            import openai
+            api_start = time.time()
+            model_id = os.environ.get("LOCAL_MODEL_ID", "google/gemma-4-31b-it")
+            model_name_label = f"vLLM ({model_id})"
+            class MockResponseWrapper:
+                def __init__(self, text): self.text = text
+
+            client = openai.OpenAI(
+                api_key=os.environ.get("OPENAI_API_KEY", "sk-vllm-dummy-key"),
+                base_url=os.environ.get("OPENAI_API_BASE", "http://localhost:8000/v1"),
+                max_retries=0, timeout=1200.0 
+            )
+            
+            dc_temp = float(os.environ.get("DC_TEMP", "0.0"))
+            dc_tokens = int(os.environ.get("DC_TOKENS", "4096"))
+            max_new_tokens = min(kwargs.get("max_new_tokens", dc_tokens), dc_tokens)
+            current_prompt = prompt
+            force_json = kwargs.get("force_json", False)
+            
+            sys_msg = (
+                "You are a strict data extraction AI. You MUST output ONLY valid JSON format.\n"
+                "🚨 CRITICAL CAPABILITY TEST: If you find a massive repository (like LOTSA), DO NOT summarize it. "
+                "You MUST extract exactly 15 to 20 representative datasets as individual entries to prove your capabilities. "
+                "Ensure the JSON array is perfectly closed."
+            )
+
+            for attempt in range(3):
+                try:
+                    if any(x in model_id.lower() for x in ["gemma-2", "deepseek", "qwen", "llama", "command-r"]): 
+                        messages = [{"role": "user", "content": sys_msg + "\n\n" + current_prompt}]
+                    else: 
+                        messages = [{"role": "system", "content": sys_msg}, {"role": "user", "content": current_prompt}]
+                    
+                    payload = {
+                        "model": model_id,
+                        "messages": messages,
+                        "max_tokens": max_new_tokens,
+                        "temperature": dc_temp
+                    }
+                    if force_json and "deepseek" not in model_id.lower():
+                        payload["response_format"] = {"type": "json_object"}
+                    
+                    response = client.chat.completions.create(**payload)
+                    if hasattr(self, '_record_timing'): self._record_timing(model_name_label, time.time() - api_start, model_name_label)
+                    
+                    raw_res = response.choices[0].message.content
+                    clean_res = re.sub(r'<think>.*?</think>', '', raw_res, flags=re.DOTALL)
+                    clean_res = clean_res.replace("```json", "").replace("```", "").strip()
+                    return MockResponseWrapper(clean_res)
+                except Exception as e:
+                    err_str = str(e).lower()
+                    
+                    if "context length" in err_str or "input_tokens" in err_str:
+                        chop_len = int(len(current_prompt) * 0.85)
+                        current_prompt = current_prompt[:chop_len] + "\n\n...[TRUNCATED TO FIT VRAM]..."
+                        continue 
+                    
+                    if attempt == 2:
+                        if os.environ.get("ABORT_ON_VLLM_FAILURE", "True") == "True":
+                            os._exit(1)
+                        else:
+                            return self._generate_content_cascade("PRO" if "strategic planner" in prompt else "FLASH", prompt, **kwargs)
+                    time.sleep(2)
+            
+            os._exit(1)
+
         api_start = time.time()
         model_name_label = f"Gemma ({getattr(self.config, 'LLM_BACKEND', 'LOCAL')})"
 
@@ -503,6 +592,7 @@ class ResearchTools:
         if not getattr(self.models, 'CLIENT', None): raise ValueError("Gemini Client not initialized.")
         pool = self._get_active_pool(str(pool_name))
 
+        force_json = kwargs.pop("force_json", False)
         max_tokens = kwargs.pop("max_new_tokens", None)
         for k in ["do_sample", "temperature", "top_p", "top_k", "repetition_penalty", "return_dict_in_generate", "output_scores", "stop"]:
             kwargs.pop(k, None)
@@ -531,6 +621,10 @@ class ResearchTools:
                     current_config.thinking_config = types.ThinkingConfig(thinking_budget=4096)
                 else:
                     current_config.thinking_config = None
+                    
+                # 🔥 STRICT JSON ENFORCEMENT FOR GEMINI
+                if force_json:
+                    current_config.response_mime_type = "application/json"
                 
                 current_kwargs["config"] = current_config
 
@@ -576,35 +670,142 @@ class ResearchTools:
 
     @profiler.track("LLM: Planner")
     def generate_content_planner(self, model_name, prompt, **kwargs):
-        if getattr(self.config, 'LLM_BACKEND', '') in ["LOCAL_PRO", "LOCAL_CLASSROOM"] and hasattr(self.models, 'LOCAL_MODEL'):
+        if getattr(self.config, 'LLM_BACKEND', '') in ["LOCAL_PRO", "LOCAL_CLASSROOM"] and (hasattr(self.models, 'LOCAL_MODEL') or getattr(self.config, 'USE_vLLM', False)):
             return self._generate_content_local(prompt, **kwargs)
+        if types and "config" not in kwargs: kwargs["config"] = types.GenerateContentConfig(response_mime_type="application/json")
         return self._generate_content_cascade("PRO", prompt, **kwargs)
 
     def generate_content_synthesizer(self, model_name, prompt, **kwargs):
-        if getattr(self.config, 'LLM_BACKEND', '') in ["LOCAL_PRO", "LOCAL_CLASSROOM"] and hasattr(self.models, 'LOCAL_MODEL'):
+        if getattr(self.config, 'LLM_BACKEND', '') in ["LOCAL_PRO", "LOCAL_CLASSROOM"] and (hasattr(self.models, 'LOCAL_MODEL') or getattr(self.config, 'USE_vLLM', False)):
             return self._generate_content_local(prompt, **kwargs)
+        if types and "config" not in kwargs: kwargs["config"] = types.GenerateContentConfig(response_mime_type="application/json")
         return self._generate_content_cascade("PRO", prompt, **kwargs)
 
     @profiler.track("LLM: Standard")
     def generate_content_standard(self, model_name, prompt, **kwargs):
-        if getattr(self.config, 'LLM_BACKEND', '') in ["LOCAL_PRO", "LOCAL_CLASSROOM"] and hasattr(self.models, 'LOCAL_MODEL'):
+        if getattr(self.config, 'LLM_BACKEND', '') in ["LOCAL_PRO", "LOCAL_CLASSROOM"] and (hasattr(self.models, 'LOCAL_MODEL') or getattr(self.config, 'USE_vLLM', False)):
             return self._generate_content_local(prompt, **kwargs)
+        if types and "config" not in kwargs: kwargs["config"] = types.GenerateContentConfig(response_mime_type="application/json")
         return self._generate_content_cascade("PRO", prompt, **kwargs)
 
     @profiler.track("LLM: RAG")
     def generate_content_rag(self, prompt, **kwargs):
-        if getattr(self.config, 'LLM_BACKEND', '') in ["LOCAL_PRO", "LOCAL_CLASSROOM"] and hasattr(self.models, 'LOCAL_MODEL'):
+        if getattr(self.config, 'LLM_BACKEND', '') in ["LOCAL_PRO", "LOCAL_CLASSROOM"] and (hasattr(self.models, 'LOCAL_MODEL') or getattr(self.config, 'USE_vLLM', False)):
             return self._generate_content_local(prompt, **kwargs)
+        if types and "config" not in kwargs: kwargs["config"] = types.GenerateContentConfig(response_mime_type="application/json")
         return self._generate_content_cascade("FLASH", prompt, **kwargs)
 
     async def generate_content_synthesizer_async(self, model_name, prompt, **kwargs):
-        if getattr(self.config, 'LLM_BACKEND', '') in ["LOCAL_PRO", "LOCAL_CLASSROOM"]:
+        if getattr(self.config, 'LLM_BACKEND', '') in ["LOCAL_PRO", "LOCAL_CLASSROOM"] and (hasattr(self.models, 'LOCAL_MODEL') or getattr(self.config, 'USE_vLLM', False)):
             return self.generate_content_synthesizer(model_name, prompt, **kwargs)
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self.thread_pool, functools.partial(self.generate_content_synthesizer, model_name, prompt, **kwargs))
 
     async def generate_content_rag_async(self, prompt, **kwargs):
-        if getattr(self.config, 'LLM_BACKEND', '') in ["LOCAL_PRO", "LOCAL_CLASSROOM"]:
-            return self.generate_content_rag(prompt, **kwargs)
+        provider = os.environ.get("TARGET_PROVIDER", getattr(self.config, 'TARGET_PROVIDER', 'GEMINI'))
+        model = os.environ.get("TARGET_MODEL", getattr(self.config, 'TARGET_MODEL', ''))
+        is_local = getattr(self.config, 'LLM_BACKEND', '') in ["LOCAL_PRO", "LOCAL_CLASSROOM"]
+        use_vllm = getattr(self.config, 'USE_vLLM', False) or os.environ.get("DEEPCOLLECTOR_USE_VLLM", "False") == "True"
+        
+        max_t = kwargs.pop("max_new_tokens", 512)
+        force_json = kwargs.get("force_json", True)
+        
+        for bad_k in ["do_sample", "temperature", "top_p", "top_k", "repetition_penalty", "return_dict_in_generate", "output_scores", "stop", "config", "force_json"]:
+            kwargs.pop(bad_k, None)
+
+        sys_msg = "You are a strict data extraction AI. You MUST output ONLY valid JSON format without markdown code blocks."
+        class MockResp:
+            def __init__(self, text): self.text = text
+        api_start = time.time()
+
+        if is_local and use_vllm:
+            import openai
+            client = openai.AsyncOpenAI(
+                api_key=os.environ.get("OPENAI_API_KEY", "sk-vllm-dummy-key"),
+                base_url=os.environ.get("OPENAI_API_BASE", "http://localhost:8000/v1"),
+                max_retries=0, timeout=1200.0
+            )
+            model_id = os.environ.get("LOCAL_MODEL_ID", "google/gemma-4-31b-it")
+            dc_temp = float(os.environ.get("DC_TEMP", "0.0"))
+            
+            if any(x in model_id.lower() for x in ["gemma-2", "deepseek", "qwen", "llama", "command-r"]): 
+                messages = [{"role": "user", "content": sys_msg + "\n\n" + prompt}]
+            else: 
+                messages = [{"role": "system", "content": sys_msg}, {"role": "user", "content": prompt}]
+            
+            for attempt in range(3):
+                try:
+                    payload = {
+                        "model": model_id, 
+                        "messages": messages, 
+                        "max_tokens": max_t, 
+                        "temperature": dc_temp
+                    }
+                    if force_json and "deepseek" not in model_id.lower():
+                        payload["response_format"] = {"type": "json_object"}
+                        
+                    resp = await client.chat.completions.create(**payload)
+                    self._record_timing(f"vLLM ({model_id})", time.time() - api_start, f"vLLM ({model_id})")
+                    raw_res = resp.choices[0].message.content
+                    clean_res = re.sub(r'<think>.*?</think>', '', raw_res, flags=re.DOTALL)
+                    clean_res = clean_res.replace("```json", "").replace("```", "").strip()
+                    return MockResp(clean_res)
+                except Exception as e:
+                    if "context length" in str(e).lower() or "input_tokens" in str(e).lower():
+                        prompt = prompt[:int(len(prompt)*0.85)] + "\n\n...[TRUNCATED]..."
+                        if any(x in model_id.lower() for x in ["gemma-2", "deepseek", "qwen", "llama", "command-r"]): messages = [{"role": "user", "content": sys_msg + "\n\n" + prompt}]
+                        else: messages[1]["content"] = prompt
+                        continue
+                    if attempt == 2: return MockResp("[missing]")
+                    await asyncio.sleep(2)
+
+        elif provider == "OPENAI":
+            import openai
+            client = openai.AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"], timeout=1800.0)
+            for attempt in range(4):
+                try:
+                    payload = {"model": model, "messages": [{"role": "system", "content": sys_msg}, {"role": "user", "content": prompt}], "temperature": 0.0, "max_tokens": max_t}
+                    if force_json: payload["response_format"] = {"type": "json_object"}
+                    if "sol" in model.lower() or "-o" in model.lower(): payload = {"model": model, "messages": [{"role": "user", "content": f"{sys_msg}\n\n{prompt}"}]}
+                    resp = await client.chat.completions.create(**payload)
+                    self._record_timing(model, time.time() - api_start, model)
+                    return MockResp(resp.choices[0].message.content.replace("```json", "").replace("```", "").strip())
+                except Exception as e:
+                    if "429" in str(e).lower() or "quota" in str(e).lower(): await asyncio.sleep((2**attempt)*3 + 2); continue
+                    if attempt == 3: raise e
+
+        elif provider == "XAI":
+            import openai
+            client = openai.AsyncOpenAI(api_key=os.environ["XAI_API_KEY"], base_url="https://api.x.ai/v1", timeout=1800.0)
+            for attempt in range(4):
+                try:
+                    payload = {"model": model, "messages": [{"role": "system", "content": sys_msg}, {"role": "user", "content": prompt}], "max_tokens": max_t}
+                    if force_json: payload["response_format"] = {"type": "json_object"}
+                    resp = await client.chat.completions.create(**payload)
+                    self._record_timing(model, time.time() - api_start, model)
+                    return MockResp(resp.choices[0].message.content.replace("```json", "").replace("```", "").strip())
+                except Exception as e:
+                    if "429" in str(e).lower() or "quota" in str(e).lower(): await asyncio.sleep((2**attempt)*3 + 2); continue
+                    if attempt == 3: raise e
+
+        elif provider == "ANTHROPIC":
+            import anthropic
+            client = anthropic.AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"], timeout=1800.0)
+            for attempt in range(4):
+                try:
+                    resp = await client.messages.create(model=model, system=sys_msg, messages=[{"role": "user", "content": prompt}], max_tokens=max_t)
+                    self._record_timing(model, time.time() - api_start, model)
+                    extracted_text = next((block.text for block in resp.content if getattr(block, "type", "") == "text"), "")
+                    return MockResp(extracted_text.replace("```json", "").replace("```", "").strip())
+                except Exception as e:
+                    if "429" in str(e).lower() or "overloaded" in str(e).lower(): await asyncio.sleep((2**attempt)*3 + 2); continue
+                    if attempt == 3: raise e
+
+        # GEMINI NATIVE ROUTE
+        if types:
+            cfg = types.GenerateContentConfig(max_output_tokens=max_t)
+            if force_json: cfg.response_mime_type = "application/json"
+            kwargs["config"] = cfg
+            
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self.thread_pool, functools.partial(self.generate_content_rag, prompt, **kwargs))

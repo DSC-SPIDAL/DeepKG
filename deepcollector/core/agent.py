@@ -302,6 +302,24 @@ class CatalogAgent:
 
                     self.analyzer.print_report()
                     self._print_llm_summary()
+                    
+                    if hasattr(self.state, 'json_attempts') and self.state.json_attempts > 0:
+                        err_rate = (self.state.json_parse_errors / self.state.json_attempts) * 100
+                        print("\n" + "="*80)
+                        print(" 🐞 JSON FORMATTING FAILURE AUDIT (Chatty Model Bias)")
+                        print("="*80)
+                        
+                        model_cfg = os.environ.get("TARGET_MODEL", getattr(self.config, "PROFILE_NAME", "Unknown"))
+                        if os.environ.get("BENCHMARK_MODE") == "LOCAL":
+                            model_cfg = os.environ.get("LOCAL_MODEL_ID", model_cfg)
+                        
+                        stats = [{
+                            "Model_Config": model_cfg,
+                            "Total_Cells_Attempted": self.state.json_attempts,
+                            "JSON_Parse_Errors": self.state.json_parse_errors,
+                            "Error_Rate (%)": f"{err_rate:.1f}"
+                        }]
+                        print(tabulate(stats, headers="keys", tablefmt="pipe", showindex=False))
 
                     df_final_report = self.get_catalog_report(full_details=False)
                     if not df_final_report.empty:
@@ -722,6 +740,11 @@ class CatalogAgent:
     def phase_0_bootstrapping(self) -> bool:
         self.state.current_phase = "BOOTSTRAPPING"
         print("\n=== PHASE 0: BOOTSTRAPPING ===")
+        
+        if getattr(self.config, 'BENCHMARK_MODE', ""):
+            import os
+            print(f"    🛑 [BENCHMARK MODE] Blind Bootstrapping Enabled. Routing RAG to {os.environ.get('TARGET_PROVIDER', 'GEMINI')}: {os.environ.get('TARGET_MODEL', 'Unknown')}.")
+            self.config.GSPREAD_AVAILABLE = False
 
         if getattr(self.config, 'GSPREAD_AVAILABLE', False):
             self.kb_manager.initialize_connection(self.authenticated_gc)
@@ -812,6 +835,17 @@ class CatalogAgent:
                 self.state.update_catalog_batch(catalog_items, allow_new_datasets=True)
                 self.analyzer.record_cell_change('FILL', len(catalog_items) * 8)
 
+    def _apply_amnesia(self):
+        if not getattr(self.config, 'APPLY_AMNESIA', False): return
+        print("\n    🛑 [AMNESIA] Wiping variables to force Cellular RAG Extraction...")
+        fields_to_wipe = ["Domain", "Detailed Description", "Time interval between points", "Number of Time Points", "Number of Locations/Series", "Variables per Location", "Total Variables", "Comments on Data Preparation"]
+        for item in self.state.catalog:
+            name = item.get("Dataset Name", {}).get("value")
+            if not name or name == "[missing]": continue
+            for field in fields_to_wipe:
+                if self.state.get_cell_data(name, field).get("value") not in ["[missing]", ""]:
+                    self.state.update_cell_data(name, field, {"value": "[missing]", "confidence": 0.0})
+
     def phase_1_standard_loop(self):
         print(f"\n--- Phase 1b: Standard Discovery Loop ---")
 
@@ -866,6 +900,7 @@ class CatalogAgent:
 
         self._validate_discovered_entities(self.state)
         self._apply_relevance_gate()
+        self._apply_amnesia()
         self.state.capture_confidence_metrics("End of Phase 1")
 
     def _validate_discovered_entities(self, state):
@@ -1165,17 +1200,27 @@ class CatalogAgent:
             # -------------------------------------------------------------
             # Enforce Naming Convention: ProjectName_YYYYMMDD_HHMM_JobID.csv
             # -------------------------------------------------------------
+            import os
             proj_name = str(getattr(self.config, 'CURRENT_PROJECT_NAME', 'UNKNOWN'))
-            safe_proj_name = re.sub(r'[^A-Za-z0-9_\-]', '_', proj_name).strip('_')
+            hybrid_model_name = os.environ.get("TARGET_MODEL", "Unknown")
+            target_run = os.environ.get("TARGET_RUN", "Run1")
             timestamp = time.strftime('%Y%m%d_%H%M')
-            filename = f"{safe_proj_name}_{timestamp}_{self.job_id}.csv"
+            safe_proj_name = re.sub(r'[^A-Za-z0-9_\-]', '_', proj_name).strip('_')
+            
+            if getattr(self.config, 'BENCHMARK_MODE', ""):
+                df.insert(0, "Project", proj_name)
+                df.insert(1, "Benchmark_Model", hybrid_model_name)
+                filename = f"Bench_{safe_proj_name}_{hybrid_model_name.replace('.','-').replace('@','_')}_{target_run}_{timestamp}.csv"
+            else:
+                filename = f"{safe_proj_name}_{timestamp}_{self.job_id}.csv"
 
             # Save Locally
             df.to_csv(filename, index=False)
             print(f"🎉 [Export] Data saved to local CSV: {filename}")
 
             # Upload to Google Drive natively
-            if hasattr(self, 'authenticated_gc') and self.authenticated_gc:
+            drive_folder = os.environ.get("DRIVE_BENCH_ID", folder_id)
+            if drive_folder and hasattr(self, 'authenticated_gc') and self.authenticated_gc:
                 try:
                     from googleapiclient.discovery import build
                     from google.auth import default
@@ -1188,7 +1233,7 @@ class CatalogAgent:
 
                     file_metadata = {
                         'name': filename,
-                        'parents': [folder_id]
+                        'parents': [drive_folder]
                     }
 
                     # Force text/csv to prevent Google Drive from converting to a Sheet
