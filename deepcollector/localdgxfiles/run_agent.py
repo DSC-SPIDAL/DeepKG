@@ -2,8 +2,15 @@
 import os
 import sys
 import time
+import asyncio
+import functools
+import concurrent.futures
+import re
 import pandas as pd
 import warnings
+import glob
+import io
+import requests
 
 # 1. LOAD .ENV (Does not override Bash exports)
 try:
@@ -26,7 +33,7 @@ if BENCHMARK_MODE == "LOCAL":
     MODEL_ID = os.environ.get("LOCAL_MODEL_ID", "google/gemma-4-31b-it")
     os.environ["DEEPCOLLECTOR_LLM_BACKEND"] = "LOCAL_PRO"
     os.environ["DEEPCOLLECTOR_USE_VLLM"] = "True"
-    os.environ["OPENAI_API_BASE"] = "http://localhost:8000/v1"
+    os.environ["OPENAI_API_BASE"] = os.environ.get("OPENAI_API_BASE", "http://localhost:8000/v1")
     os.environ["OPENAI_API_KEY"] = "sk-vllm-dummy-key"
 else:
     os.environ["DEEPCOLLECTOR_LLM_BACKEND"] = "GEMINI"
@@ -91,7 +98,6 @@ PROJECT_NAMES = [PROJECT_NAME_ARG]
 
 print(f"\n🖥️ DEEPCOLLECTOR INITIALIZED...")
 print(f"   - Environment: {BENCHMARK_MODE} (Provider: {TARGET_PROVIDER} | Model: {MODEL_ID})")
-print(f"   - Deep Research: {'ACTIVE' if ENABLE_DR else 'DISABLED'}")
 print(f"   - Target Project: {PROJECT_NAMES[0]}\n")
 
 try: execute_jobs(mode="AGENT", project_names=PROJECT_NAMES, base_config=config, gc_client=gc, dry_run=False)

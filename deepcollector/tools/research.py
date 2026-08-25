@@ -1,6 +1,7 @@
 # =============================================================================
-# V261: Research Tools (Full Untruncated Native PyTorch + 404/429 Cascade & Thinking Payload)
+# V262: Research Tools (Full Untruncated Native PyTorch + OmniRouter + JSON Constraints)
 # =============================================================================
+import os
 import requests
 import time
 import re
@@ -45,6 +46,7 @@ try:
 except ImportError:
     types = None
 
+
 class ResearchTools:
     MAX_FETCH_LENGTH = 1000000
     MAX_PDF_PAGES = 50
@@ -72,7 +74,6 @@ class ResearchTools:
         self.GEMINI_API_RETRY_STRATEGY = get_gemini_retry_strategy(self.verbosity)
 
         self._fetch_page_content_impl = self.NETWORK_RETRY_STRATEGY(self._fetch_page_content_impl)
-        self._generate_content_cascade = self.GEMINI_API_RETRY_STRATEGY(self._generate_content_cascade)
 
     def _get_active_pool(self, pool_name: str) -> list:
         with self.pool_lock:
@@ -464,7 +465,15 @@ class ResearchTools:
                     if force_json and "deepseek" not in model_id.lower():
                         payload["response_format"] = {"type": "json_object"}
                     
-                    response = client.chat.completions.create(**payload)
+                    try:
+                        response = client.chat.completions.create(**payload)
+                    except Exception as api_err:
+                        if "format" in str(api_err).lower() or "json" in str(api_err).lower() or "400" in str(api_err).lower():
+                            payload.pop("response_format", None)
+                            response = client.chat.completions.create(**payload)
+                        else:
+                            raise api_err
+                            
                     if hasattr(self, '_record_timing'): self._record_timing(model_name_label, time.time() - api_start, model_name_label)
                     
                     raw_res = response.choices[0].message.content
@@ -515,7 +524,6 @@ class ResearchTools:
             except Exception:
                 formatted_prompt = f"<bos><start_of_turn>user\n{sys_prefix}{prompt}<end_of_turn>\n<start_of_turn>model\n"
 
-            # 4-bit gives us tons of room. Start with massive limit and back off dynamically.
             current_max_len = 32000
             req_max_new = min(kwargs.get("max_new_tokens", 1024), 2048)
 
@@ -540,7 +548,7 @@ class ResearchTools:
                             outputs = model.generate(
                                 **inputs,
                                 max_new_tokens=req_max_new,
-                                do_sample=False, # Greedy decoding (NaN immune)
+                                do_sample=False,
                                 use_cache=True,
                                 pad_token_id=tokenizer.eos_token_id,
                                 eos_token_id=terminators,
@@ -549,7 +557,6 @@ class ResearchTools:
                                 return_dict_in_generate=False
                             )
 
-                    # SAFE PYTORCH SLICING
                     prompt_len = inputs["input_ids"].shape[1]
                     out_tensor = outputs[0][prompt_len:]
                     out_tokens_list = out_tensor.cpu().tolist()
@@ -605,7 +612,6 @@ class ResearchTools:
             
             current_kwargs = dict(kwargs)
             
-            # ✅ Manual deep copy to prevent SDK schema contamination during fallbacks
             if types:
                 current_config = types.GenerateContentConfig()
                 if base_config:
@@ -646,7 +652,6 @@ class ResearchTools:
                 if self.verbosity >= 1:
                     print(f"    ⚠️ [Cascade] '{target_model_str}' failed: {type(e).__name__} - {str(e)[:150]}")
                 
-                # 🛡️ BULLETPROOF FALLBACK CASCADE
                 if ("404" in error_str or "not found" in error_str or 
                     "429" in error_str or "quota" in error_str or 
                     "503" in error_str or "timeout" in error_str or 
@@ -708,7 +713,7 @@ class ResearchTools:
         use_vllm = getattr(self.config, 'USE_vLLM', False) or os.environ.get("DEEPCOLLECTOR_USE_VLLM", "False") == "True"
         
         max_t = kwargs.pop("max_new_tokens", 512)
-        force_json = kwargs.get("force_json", True)
+        force_json = kwargs.pop("force_json", True) 
         
         for bad_k in ["do_sample", "temperature", "top_p", "top_k", "repetition_penalty", "return_dict_in_generate", "output_scores", "stop", "config", "force_json"]:
             kwargs.pop(bad_k, None)
@@ -718,6 +723,7 @@ class ResearchTools:
             def __init__(self, text): self.text = text
         api_start = time.time()
 
+        # 1. LOCAL vLLM
         if is_local and use_vllm:
             import openai
             client = openai.AsyncOpenAI(
@@ -735,30 +741,32 @@ class ResearchTools:
             
             for attempt in range(3):
                 try:
-                    payload = {
-                        "model": model_id, 
-                        "messages": messages, 
-                        "max_tokens": max_t, 
-                        "temperature": dc_temp
-                    }
+                    payload = {"model": model_id, "messages": messages, "max_tokens": max_t, "temperature": dc_temp}
                     if force_json and "deepseek" not in model_id.lower():
                         payload["response_format"] = {"type": "json_object"}
                         
-                    resp = await client.chat.completions.create(**payload)
+                    try:
+                        resp = await client.chat.completions.create(**payload)
+                    except Exception as api_err:
+                        if "format" in str(api_err).lower() or "json" in str(api_err).lower() or "400" in str(api_err).lower():
+                            payload.pop("response_format", None)
+                            resp = await client.chat.completions.create(**payload)
+                        else:
+                            raise api_err
+
                     self._record_timing(f"vLLM ({model_id})", time.time() - api_start, f"vLLM ({model_id})")
-                    raw_res = resp.choices[0].message.content
-                    clean_res = re.sub(r'<think>.*?</think>', '', raw_res, flags=re.DOTALL)
-                    clean_res = clean_res.replace("```json", "").replace("```", "").strip()
-                    return MockResp(clean_res)
+                    clean_res = re.sub(r'<think>.*?</think>', '', resp.choices[0].message.content, flags=re.DOTALL)
+                    return MockResp(clean_res.replace("```json", "").replace("```", "").strip())
                 except Exception as e:
                     if "context length" in str(e).lower() or "input_tokens" in str(e).lower():
                         prompt = prompt[:int(len(prompt)*0.85)] + "\n\n...[TRUNCATED]..."
-                        if any(x in model_id.lower() for x in ["gemma-2", "deepseek", "qwen", "llama", "command-r"]): messages = [{"role": "user", "content": sys_msg + "\n\n" + prompt}]
+                        if any(x in model_id.lower() for x in ["gemma-2", "deepseek", "qwen", "llama", "command-r"]): messages[0]["content"] = sys_msg + "\n\n" + prompt
                         else: messages[1]["content"] = prompt
                         continue
                     if attempt == 2: return MockResp("[missing]")
                     await asyncio.sleep(2)
 
+        # 2. OPENAI ROUTE
         elif provider == "OPENAI":
             import openai
             client = openai.AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"], timeout=1800.0)
@@ -774,20 +782,7 @@ class ResearchTools:
                     if "429" in str(e).lower() or "quota" in str(e).lower(): await asyncio.sleep((2**attempt)*3 + 2); continue
                     if attempt == 3: raise e
 
-        elif provider == "XAI":
-            import openai
-            client = openai.AsyncOpenAI(api_key=os.environ["XAI_API_KEY"], base_url="https://api.x.ai/v1", timeout=1800.0)
-            for attempt in range(4):
-                try:
-                    payload = {"model": model, "messages": [{"role": "system", "content": sys_msg}, {"role": "user", "content": prompt}], "max_tokens": max_t}
-                    if force_json: payload["response_format"] = {"type": "json_object"}
-                    resp = await client.chat.completions.create(**payload)
-                    self._record_timing(model, time.time() - api_start, model)
-                    return MockResp(resp.choices[0].message.content.replace("```json", "").replace("```", "").strip())
-                except Exception as e:
-                    if "429" in str(e).lower() or "quota" in str(e).lower(): await asyncio.sleep((2**attempt)*3 + 2); continue
-                    if attempt == 3: raise e
-
+        # 3. ANTHROPIC ROUTE (Direct API)
         elif provider == "ANTHROPIC":
             import anthropic
             client = anthropic.AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"], timeout=1800.0)
@@ -801,11 +796,13 @@ class ResearchTools:
                     if "429" in str(e).lower() or "overloaded" in str(e).lower(): await asyncio.sleep((2**attempt)*3 + 2); continue
                     if attempt == 3: raise e
 
-        # GEMINI NATIVE ROUTE
+        # 4. GEMINI ROUTE (Cascade Default)
         if types:
             cfg = types.GenerateContentConfig(max_output_tokens=max_t)
             if force_json: cfg.response_mime_type = "application/json"
             kwargs["config"] = cfg
-            
+
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self.thread_pool, functools.partial(self.generate_content_rag, prompt, **kwargs))
+        import functools
+        return await loop.run_in_executor(self.thread_pool, functools.partial(self._generate_content_cascade, "FLASH", prompt, **kwargs))
+

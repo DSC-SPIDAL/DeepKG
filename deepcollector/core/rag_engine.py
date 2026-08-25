@@ -1,6 +1,7 @@
 # =============================================================================
-# V184: RAG Engine (Dynamic Token Bounds for Reasoning Models)
+# V185: RAG Engine (JSON Parsing Guard & Dynamic vLLM Batch Routing)
 # =============================================================================
+import os
 import json
 import re
 import asyncio
@@ -115,7 +116,6 @@ class RAGEngine:
             )
 
             model = self.tools.models.MODEL_SYNTHESIZER
-            # 🔥 FIX 1: Allow reasoning models space to think during Discovery
             discovery_limit = getattr(self.config, 'RAG_MAX_NEW_TOKENS', 1536)
             response = self.tools.generate_content_synthesizer(model, prompt, max_new_tokens=discovery_limit)
 
@@ -247,7 +247,6 @@ class RAGEngine:
 
         try:
             model = self.tools.models.MODEL_PLANNER
-            # 🔥 FIX 2: Allow reasoning models space to think during Search Strategy Generation
             planner_limit = getattr(self.config, 'RAG_MAX_NEW_TOKENS', 512)
             response = self.tools.generate_content_planner(model, prompt, max_new_tokens=planner_limit)
 
