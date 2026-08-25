@@ -1,5 +1,5 @@
 # =============================================================================
-# V262: Research Tools (Full Untruncated Native PyTorch + OmniRouter + JSON Constraints)
+# V263: Research Tools (Strict JSON Schema + Colab/DGX Path Separation)
 # =============================================================================
 import os
 import requests
@@ -110,19 +110,24 @@ class ResearchTools:
                  return text[:self.MAX_FETCH_LENGTH] + "... [TRUNCATED]"
              return text
 
-        if url.startswith('/content/drive/'):
+        if url.startswith('/content/drive/') or url.startswith('~'):
             try:
                 import os
-                # Map Colab path to local DGX path
-                if "PDFGems" in url:
+                # 🔥 FIX: Only Map Colab path to local DGX path if we are physically on LOCAL hardware
+                if os.environ.get("BENCHMARK_MODE") == "LOCAL" and ("PDFGems" in url or "/content/drive/" in url):
                     filename = os.path.basename(url)
                     url = os.path.expanduser(f"~/Desktop/DeepKG/PDFGems/{filename}")
-                    
-                if self.verbosity >= 2: print(f"    📁 [Local Fetch] Reading {url} directly from local disk...")
+                
+                if not os.path.exists(url):
+                    if self.verbosity >= 1: print(f"    ⚠️ [Local Fetch] File not found: {url}")
+                    return ""
+
+                if self.verbosity >= 2: print(f"    📁 [Local Fetch] Reading {url} directly from disk...")
                 with open(url, 'rb') as f:
                     content = f.read()
                 content_type = 'application/pdf' if url.lower().endswith('.pdf') else 'text/plain'
-            except Exception:
+            except Exception as e:
+                if self.verbosity >= 1: print(f"    ⚠️ [Local Fetch Error] {e}")
                 return ""
         else:
             if "github.com" in url and "/blob/" not in url and "/tree/" not in url:
@@ -399,7 +404,7 @@ class ResearchTools:
                             text += (page.extract_text() or "") + "\n"
                         if text and len(text.split()) >= 15:
                             return [{"url": url, "content": text, "title": f"ArXiv Paper {paper_id}", "type": "Direct Load"}]
-                except Exception as e:
+                except Exception:
                     pass
 
         try:
@@ -628,8 +633,8 @@ class ResearchTools:
                 else:
                     current_config.thinking_config = None
                     
-                # 🔥 STRICT JSON ENFORCEMENT FOR GEMINI
-                if force_json:
+                # 🔥 STRICT JSON ENFORCEMENT FOR GEMINI (Fallback if schema missing)
+                if force_json and not getattr(current_config, "response_schema", None):
                     current_config.response_mime_type = "application/json"
                 
                 current_kwargs["config"] = current_config
@@ -677,28 +682,73 @@ class ResearchTools:
     def generate_content_planner(self, model_name, prompt, **kwargs):
         if getattr(self.config, 'LLM_BACKEND', '') in ["LOCAL_PRO", "LOCAL_CLASSROOM"] and (hasattr(self.models, 'LOCAL_MODEL') or getattr(self.config, 'USE_vLLM', False)):
             return self._generate_content_local(prompt, **kwargs)
-        if types and "config" not in kwargs: kwargs["config"] = types.GenerateContentConfig(response_mime_type="application/json")
-        return self._generate_content_cascade("PRO", prompt, **kwargs)
+        if types and "config" not in kwargs:
+            cfg = types.GenerateContentConfig(response_mime_type="application/json")
+            try:
+                cfg.response_schema = types.Schema(
+                    type=types.Type.ARRAY,
+                    items=types.Schema(type=types.Type.STRING)
+                )
+            except Exception: pass
+            kwargs["config"] = cfg
+        return self._generate_content_cascade("PRO", prompt, force_json=True, **kwargs)
 
     def generate_content_synthesizer(self, model_name, prompt, **kwargs):
         if getattr(self.config, 'LLM_BACKEND', '') in ["LOCAL_PRO", "LOCAL_CLASSROOM"] and (hasattr(self.models, 'LOCAL_MODEL') or getattr(self.config, 'USE_vLLM', False)):
             return self._generate_content_local(prompt, **kwargs)
-        if types and "config" not in kwargs: kwargs["config"] = types.GenerateContentConfig(response_mime_type="application/json")
-        return self._generate_content_cascade("PRO", prompt, **kwargs)
+        if types and "config" not in kwargs:
+            cfg = types.GenerateContentConfig(response_mime_type="application/json")
+            try:
+                cfg.response_schema = types.Schema(
+                    type=types.Type.OBJECT,
+                    properties={
+                        "discovered_datasets": types.Schema(
+                            type=types.Type.ARRAY,
+                            items=types.Schema(
+                                type=types.Type.OBJECT,
+                                properties={
+                                    "dataset_name": types.Schema(type=types.Type.STRING),
+                                    "type": types.Schema(type=types.Type.STRING),
+                                    "confidence": types.Schema(type=types.Type.NUMBER),
+                                    "rationale": types.Schema(type=types.Type.STRING)
+                                },
+                                required=["dataset_name", "type", "confidence", "rationale"]
+                            )
+                        )
+                    },
+                    required=["discovered_datasets"]
+                )
+            except Exception: pass
+            kwargs["config"] = cfg
+        return self._generate_content_cascade("PRO", prompt, force_json=True, **kwargs)
 
     @profiler.track("LLM: Standard")
     def generate_content_standard(self, model_name, prompt, **kwargs):
         if getattr(self.config, 'LLM_BACKEND', '') in ["LOCAL_PRO", "LOCAL_CLASSROOM"] and (hasattr(self.models, 'LOCAL_MODEL') or getattr(self.config, 'USE_vLLM', False)):
             return self._generate_content_local(prompt, **kwargs)
-        if types and "config" not in kwargs: kwargs["config"] = types.GenerateContentConfig(response_mime_type="application/json")
-        return self._generate_content_cascade("PRO", prompt, **kwargs)
+        if types and "config" not in kwargs: 
+            kwargs["config"] = types.GenerateContentConfig(response_mime_type="application/json")
+        return self._generate_content_cascade("PRO", prompt, force_json=True, **kwargs)
 
     @profiler.track("LLM: RAG")
     def generate_content_rag(self, prompt, **kwargs):
         if getattr(self.config, 'LLM_BACKEND', '') in ["LOCAL_PRO", "LOCAL_CLASSROOM"] and (hasattr(self.models, 'LOCAL_MODEL') or getattr(self.config, 'USE_vLLM', False)):
             return self._generate_content_local(prompt, **kwargs)
-        if types and "config" not in kwargs: kwargs["config"] = types.GenerateContentConfig(response_mime_type="application/json")
-        return self._generate_content_cascade("FLASH", prompt, **kwargs)
+        if types and "config" not in kwargs:
+            cfg = types.GenerateContentConfig(response_mime_type="application/json")
+            try:
+                cfg.response_schema = types.Schema(
+                    type=types.Type.OBJECT,
+                    properties={
+                        "value": types.Schema(type=types.Type.STRING),
+                        "confidence": types.Schema(type=types.Type.NUMBER),
+                        "rationale": types.Schema(type=types.Type.STRING)
+                    },
+                    required=["value", "confidence", "rationale"]
+                )
+            except Exception: pass
+            kwargs["config"] = cfg
+        return self._generate_content_cascade("FLASH", prompt, force_json=True, **kwargs)
 
     async def generate_content_synthesizer_async(self, model_name, prompt, **kwargs):
         if getattr(self.config, 'LLM_BACKEND', '') in ["LOCAL_PRO", "LOCAL_CLASSROOM"] and (hasattr(self.models, 'LOCAL_MODEL') or getattr(self.config, 'USE_vLLM', False)):
@@ -799,10 +849,21 @@ class ResearchTools:
         # 4. GEMINI ROUTE (Cascade Default)
         if types:
             cfg = types.GenerateContentConfig(max_output_tokens=max_t)
-            if force_json: cfg.response_mime_type = "application/json"
+            if force_json:
+                cfg.response_mime_type = "application/json"
+                try:
+                    cfg.response_schema = types.Schema(
+                        type=types.Type.OBJECT,
+                        properties={
+                            "value": types.Schema(type=types.Type.STRING),
+                            "confidence": types.Schema(type=types.Type.NUMBER),
+                            "rationale": types.Schema(type=types.Type.STRING)
+                        },
+                        required=["value", "confidence", "rationale"]
+                    )
+                except Exception: pass
             kwargs["config"] = cfg
 
         loop = asyncio.get_running_loop()
         import functools
-        return await loop.run_in_executor(self.thread_pool, functools.partial(self._generate_content_cascade, "FLASH", prompt, **kwargs))
-
+        return await loop.run_in_executor(self.thread_pool, functools.partial(self._generate_content_cascade, "FLASH", prompt, force_json=force_json, **kwargs))

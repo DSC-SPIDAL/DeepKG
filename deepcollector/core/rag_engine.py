@@ -1,5 +1,5 @@
 # =============================================================================
-# V185: RAG Engine (JSON Parsing Guard & Dynamic vLLM Batch Routing)
+# V186: RAG Engine (JSON Parsing Guard & Dynamic vLLM Batch Routing)
 # =============================================================================
 import os
 import json
@@ -291,7 +291,6 @@ class RAGEngine:
         return fills, refinements, confirmed
 
     async def _run_rag_batches(self, state, candidate_cells, retriever):
-        import os
         results = []
         total_cells = len(candidate_cells)
         is_local = getattr(self.config, 'LLM_BACKEND', '') in ["LOCAL_PRO", "LOCAL_CLASSROOM"]
@@ -393,7 +392,6 @@ class RAGEngine:
 
     async def _extract_cell_data_rag(self, dataset_name, effective_name, field_name, query_template, verified_url, retriever, state=None) -> Optional[RAGResult]:
         if state is not None: state.json_attempts += 1
-        is_local = getattr(self.config, 'LLM_BACKEND', '') in ["LOCAL_PRO", "LOCAL_CLASSROOM"]
         base_query = query_template.format(name=effective_name)
         queries = [base_query]
 

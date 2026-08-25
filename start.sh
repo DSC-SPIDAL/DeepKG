@@ -1,6 +1,4 @@
 #!/bin/bash
-# Usage: ./start.sh [model] [context_size] [concurrency] [project]
-
 MODEL_CHOICE=${1:-gemma4}
 export LOCAL_MAX_CONTEXT=${2:-32768}
 export VLLM_CONCURRENCY=${3:-16}
@@ -54,7 +52,6 @@ pkill -9 -f run_agent.py >/dev/null 2>&1 || true
 rm -rf /dev/shm/vllm* /dev/shm/nccl* /dev/shm/core* 2>/dev/null
 
 if [ "$BENCHMARK_MODE" == "LOCAL" ]; then
-    # 🔥 vLLM MEMORY FIX: Lower GPU util for 131K contexts so NCCL doesn't deadlock
     MEM_UTIL="0.95"
     if [ "$LOCAL_MAX_CONTEXT" == "131072" ]; then MEM_UTIL="0.85"; fi
 
@@ -66,7 +63,6 @@ if [ "$BENCHMARK_MODE" == "LOCAL" ]; then
     
     docker run -e VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 -d --name vllm_engine --gpus all --shm-size 32g -e NVIDIA_VISIBLE_DEVICES="0,1,2,4" -e HF_TOKEN="$HF_TOKEN" -v /raid/huggingface_cache:/root/.cache/huggingface -p 8000:8000 --ipc=host vllm/vllm-openai:latest "${DOCKER_ARGS[@]}" > /dev/null
 
-    # 🔥 vLLM TIMEOUT FIX: Kill if weights fail to load in 15 minutes
     MAX_WAIT=180 
     WAITED=0
     
@@ -74,13 +70,15 @@ if [ "$BENCHMARK_MODE" == "LOCAL" ]; then
     while [ "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8000/health)" != "200" ]; do 
         if [ "$(docker inspect -f '{{.State.Running}}' vllm_engine 2>/dev/null)" == "false" ]; then
             echo -e "\n\n❌ [FATAL] vLLM Docker container crashed!"
-            docker logs vllm_engine | tail -n 25
+            docker logs vllm_engine > vllm_crash.log 2>&1
+            tail -n 25 vllm_crash.log
             exit 1
         fi
         
         WAITED=$((WAITED + 1))
         if [ $WAITED -ge $MAX_WAIT ]; then
-            echo -e "\n\n❌ [TIMEOUT] vLLM hung for 15 minutes loading weights. System out of contiguous memory."
+            echo -e "\n\n❌ [TIMEOUT] vLLM hung for 15 minutes."
+            docker logs vllm_engine > vllm_crash.log 2>&1
             docker rm -f vllm_engine >/dev/null 2>&1
             exit 1
         fi
@@ -89,7 +87,7 @@ if [ "$BENCHMARK_MODE" == "LOCAL" ]; then
         sleep 5
     done
     echo -e "\n✅ vLLM is Ready!"
-    docker exec vllm_engine pip install arxiv pypdf
+    docker exec vllm_engine pip install arxiv pypdf >/dev/null 2>&1
 fi
 
 TIMESTAMP=$(date +%Y%m%d_%H%M)
