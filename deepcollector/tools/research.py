@@ -1,5 +1,5 @@
 # =============================================================================
-# V263: Research Tools (Strict JSON Schema + Colab/DGX Path Separation)
+# V265: Research Tools (Strict Temp 0.0 Lock & SDK Warning Suppression)
 # =============================================================================
 import os
 import requests
@@ -14,6 +14,11 @@ import json
 import functools
 import concurrent.futures
 import threading
+import logging
+
+# Suppress new google.genai AFC and API warnings
+logging.getLogger("google_genai.models").setLevel(logging.ERROR)
+logging.getLogger("google_genai._api_client").setLevel(logging.ERROR)
 
 try:
     import torch
@@ -113,7 +118,6 @@ class ResearchTools:
         if url.startswith('/content/drive/') or url.startswith('~'):
             try:
                 import os
-                # 🔥 FIX: Only Map Colab path to local DGX path if we are physically on LOCAL hardware
                 if os.environ.get("BENCHMARK_MODE") == "LOCAL" and ("PDFGems" in url or "/content/drive/" in url):
                     filename = os.path.basename(url)
                     url = os.path.expanduser(f"~/Desktop/DeepKG/PDFGems/{filename}")
@@ -226,20 +230,6 @@ class ResearchTools:
         if self.verbosity >= 1: print(f"🌐 [Tool: Search/Fetch] Query: '{query}'")
         if num_results is None: num_results = getattr(self.config, 'SEARCH_NUM_RESULTS', 10)
 
-        if getattr(self.config, 'SEARCH_BACKEND', 'GEMINI') == "SEARXNG":
-            try:
-                from deepcollector.utils.initialization import SearXNGClient
-                client = SearXNGClient(base_url=getattr(self.config, 'SEARXNG_URL', "http://localhost:8080"))
-                results = client.search(query, max_results=num_results)
-                if results: return results
-                else:
-                    simple_query = self._simplify_query(query)
-                    if simple_query != query and len(simple_query) > 3:
-                        results = client.search(simple_query, max_results=num_results)
-                        if results: return results
-            except Exception as e:
-                if self.verbosity >= 1: print(f"    ⚠️ SearXNG Failed ({e}). Falling back to Gemini Search...")
-
         if not self.SEARCH_ENABLED:
             return []
 
@@ -279,7 +269,6 @@ class ResearchTools:
             tracker_key = f"{target_model_str} (Search)"
 
             try:
-                # 🚀 Apply Thinking Config + Search Tool Safely
                 if types:
                     cfg = types.GenerateContentConfig(tools=[types.Tool(google_search=types.GoogleSearch())])
                     if "3.1-pro" in target_model_str or "3-pro" in target_model_str:
@@ -335,7 +324,6 @@ class ResearchTools:
                     
                     time.sleep(1.0)
                     if current_idx < len(pool) - 1: 
-                        if self.verbosity >= 1: print(f"    ➡️ Search cascading to next model: {pool[current_idx+1]}")
                         continue
                     else: return []
                 else: 
@@ -352,36 +340,42 @@ class ResearchTools:
 
     def _extract_json_robustly(self, text: str) -> Any:
         if not text or text == "[missing]": return []
-        if not isinstance(text, str): text = str(text)
+        text = str(text).strip()
+        
+        # 1. Aggressively strip chatty prefixes and markdown blocks
+        text = re.sub(r'^.*?```json\s*', '', text, flags=re.IGNORECASE | re.DOTALL)
+        text = re.sub(r'^.*?```\s*', '', text, flags=re.IGNORECASE | re.DOTALL)
+        text = re.sub(r'\s*```.*$', '', text, flags=re.IGNORECASE | re.DOTALL)
+        text = text.strip()
 
-        text = re.sub(r',\s*([\]}])', r'\1', text)
-        text = re.split(r'\n\s*thought\b', text, maxsplit=1, flags=re.IGNORECASE)[0]
-        text = re.split(r'\n\s*Wait, I noticed', text, maxsplit=1, flags=re.IGNORECASE)[0]
-        text = re.split(r'======', text, maxsplit=1)[0]
-
-        match = re.search(r"`{3}(?:json)?\n(.*?)\n`{3}", text, re.DOTALL | re.IGNORECASE)
-        if match:
-            try: return json.loads(match.group(1))
-            except Exception: pass
-
-        def extract_balanced(s, open_char, close_char):
-            start = s.find(open_char)
-            if start == -1: return None
-            count = 0
-            for i in range(start, len(s)):
-                if s[i] == open_char: count += 1
-                elif s[i] == close_char: count -= 1
-                if count == 0:
-                    try: return json.loads(s[start:i+1])
-                    except: return None
-            return None
-
-        res = extract_balanced(text, '[', ']')
-        if res is not None: return res
-
-        res = extract_balanced(text, '{', '}')
-        if res is not None: return res
-
+        # 2. Find structural boundaries
+        start_obj = text.find('{')
+        start_arr = text.find('[')
+        
+        try:
+            if start_obj != -1 and (start_arr == -1 or start_obj < start_arr):
+                end_obj = text.rfind('}')
+                if end_obj != -1:
+                    return json.loads(text[start_obj:end_obj+1])
+            elif start_arr != -1:
+                end_arr = text.rfind(']')
+                if end_arr != -1:
+                    return json.loads(text[start_arr:end_arr+1])
+        except Exception:
+            pass
+            
+        # 3. Invincible Regex Fallback (Catches poorly escaped strings)
+        result = {}
+        val_match = re.search(r'"value"\s*:\s*"?([^"\}]+)"?', text, re.IGNORECASE)
+        conf_match = re.search(r'"confidence"\s*:\s*([\d\.]+)', text, re.IGNORECASE)
+        rat_match = re.search(r'"rationale"\s*:\s*"?([^"\}]+)"?', text, re.IGNORECASE)
+        
+        if val_match: result['value'] = val_match.group(1).strip()
+        if conf_match: result['confidence'] = float(conf_match.group(1))
+        if rat_match: result['rationale'] = rat_match.group(1).strip()
+        
+        if result: return result
+        
         return []
 
     def tool_load_url(self, url: str) -> List[Dict[str, str]]:
@@ -394,7 +388,7 @@ class ResearchTools:
                     import requests
                     import io
                     import pypdf
-                    target_url = f"https://arxiv.org/pdf/{paper_id}.pdf"
+                    target_url = f"[https://arxiv.org/pdf/](https://arxiv.org/pdf/){paper_id}.pdf"
                     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
                     response = requests.get(target_url, headers=headers, timeout=30)
                     if response.status_code == 200:
@@ -487,19 +481,14 @@ class ResearchTools:
                     return MockResponseWrapper(clean_res)
                 except Exception as e:
                     err_str = str(e).lower()
-                    
                     if "context length" in err_str or "input_tokens" in err_str:
                         chop_len = int(len(current_prompt) * 0.85)
                         current_prompt = current_prompt[:chop_len] + "\n\n...[TRUNCATED TO FIT VRAM]..."
                         continue 
-                    
                     if attempt == 2:
-                        if os.environ.get("ABORT_ON_VLLM_FAILURE", "True") == "True":
-                            os._exit(1)
-                        else:
-                            return self._generate_content_cascade("PRO" if "strategic planner" in prompt else "FLASH", prompt, **kwargs)
+                        if os.environ.get("ABORT_ON_VLLM_FAILURE", "True") == "True": os._exit(1)
+                        else: return self._generate_content_cascade("PRO" if "strategic planner" in prompt else "FLASH", prompt, **kwargs)
                     time.sleep(2)
-            
             os._exit(1)
 
         api_start = time.time()
@@ -509,25 +498,18 @@ class ResearchTools:
             def __init__(self, text): self.text = text
 
         with self.local_llm_lock:
-            inputs = None
-            outputs = None
-            out_tokens_list = []
-
+            inputs = None; outputs = None; out_tokens_list = []
             model = getattr(self.models, 'LOCAL_MODEL', None)
             tokenizer = getattr(self.models, 'LOCAL_TOKENIZER', None)
 
             if not model or not tokenizer or isinstance(model, str):
-                if getattr(self.config, 'VERBOSITY_LEVEL', 1) >= 2:
-                    print(f"    ⚠️ Local PyTorch model not loaded (Found {type(model)}). Falling back to Cloud Gemini...")
                 return self._generate_content_cascade("PRO" if "strategic planner" in prompt else "FLASH", prompt, **kwargs)
 
             sys_prefix = "You are a strict data extraction AI. You MUST output ONLY valid JSON format.\n\n"
             chat = [{"role": "user", "content": sys_prefix + prompt}]
 
-            try:
-                formatted_prompt = tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
-            except Exception:
-                formatted_prompt = f"<bos><start_of_turn>user\n{sys_prefix}{prompt}<end_of_turn>\n<start_of_turn>model\n"
+            try: formatted_prompt = tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
+            except Exception: formatted_prompt = f"<bos><start_of_turn>user\n{sys_prefix}{prompt}<end_of_turn>\n<start_of_turn>model\n"
 
             current_max_len = 32000
             req_max_new = min(kwargs.get("max_new_tokens", 1024), 2048)
@@ -535,31 +517,22 @@ class ResearchTools:
             while current_max_len >= 2000:
                 try:
                     if torch is not None and torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                        torch.cuda.ipc_collect()
+                        torch.cuda.empty_cache(); torch.cuda.ipc_collect()
                     gc.collect()
 
                     inputs = tokenizer(formatted_prompt, return_tensors="pt", truncation=True, max_length=current_max_len).to(model.device)
-
                     terminators = [tokenizer.eos_token_id]
                     if hasattr(tokenizer, "get_vocab"):
                         vocab = tokenizer.get_vocab()
                         for t in ["<end_of_turn>", "<|eot_id|>", "<|im_end|>"]:
-                            if t in vocab:
-                                terminators.append(vocab[t])
+                            if t in vocab: terminators.append(vocab[t])
 
                     with torch.inference_mode():
                         with torch.autocast("cuda", dtype=torch.bfloat16):
                             outputs = model.generate(
-                                **inputs,
-                                max_new_tokens=req_max_new,
-                                do_sample=False,
-                                use_cache=True,
-                                pad_token_id=tokenizer.eos_token_id,
-                                eos_token_id=terminators,
-                                output_attentions=False,
-                                output_hidden_states=False,
-                                return_dict_in_generate=False
+                                **inputs, max_new_tokens=req_max_new, do_sample=False, use_cache=True,
+                                pad_token_id=tokenizer.eos_token_id, eos_token_id=terminators,
+                                output_attentions=False, output_hidden_states=False, return_dict_in_generate=False
                             )
 
                     prompt_len = inputs["input_ids"].shape[1]
@@ -570,14 +543,9 @@ class ResearchTools:
                 except Exception as e:
                     err_str = str(e).lower()
                     if "cuda out of memory" in err_str or "outofmemoryerror" in err_str or "alloc" in err_str:
-                        if getattr(self.config, 'VERBOSITY_LEVEL', 1) >= 1:
-                            print(f"    ⚠️ [VRAM Ceiling Hit] OOM at {current_max_len} tokens. Truncating by 25% and retrying...")
-
                         current_max_len = int(current_max_len * 0.75)
-
                         if 'inputs' in locals() and inputs is not None: del inputs
                         if 'outputs' in locals() and outputs is not None: del outputs
-
                         if hasattr(sys, 'last_traceback'): sys.last_traceback = None
                         if hasattr(sys, 'last_type'): sys.last_type = None
                         if hasattr(sys, 'last_value'): sys.last_value = None
@@ -585,8 +553,6 @@ class ResearchTools:
                         del e
                         continue
                     else:
-                        if getattr(self.config, 'VERBOSITY_LEVEL', 1) >= 1:
-                            print(f"    ⚠️ [Local PyTorch Error] {e}. Falling back to Cloud...")
                         return self._generate_content_cascade("PRO" if "strategic planner" in prompt else "FLASH", prompt, **kwargs)
 
             if not out_tokens_list:
@@ -596,9 +562,7 @@ class ResearchTools:
             del prompt
             duration = time.time() - api_start
             self._record_timing(model_name_label, duration, model_name_label)
-
-            clean_res = response_text.replace("`" * 3 + "json", "").replace("`" * 3, "").strip()
-            return MockResponseWrapper(clean_res)
+            return MockResponseWrapper(response_text.replace("`" * 3 + "json", "").replace("`" * 3, "").strip())
 
     def _generate_content_cascade(self, pool_name: str, prompt: str, **kwargs):
         if not getattr(self.models, 'CLIENT', None): raise ValueError("Gemini Client not initialized.")
@@ -606,26 +570,27 @@ class ResearchTools:
 
         force_json = kwargs.pop("force_json", False)
         max_tokens = kwargs.pop("max_new_tokens", None)
+        base_config = kwargs.pop("config", None)
+        
         for k in ["do_sample", "temperature", "top_p", "top_k", "repetition_penalty", "return_dict_in_generate", "output_scores", "stop"]:
             kwargs.pop(k, None)
 
-        base_config = kwargs.get("config", None)
+        # 🔥 Ensure System Message is applied correctly to block chatty behavior
+        sys_msg = "You are a strict data extraction AI. You MUST output ONLY valid JSON format without markdown code blocks."
 
         for current_idx, target_model in enumerate(list(pool)):
             api_start = time.time()
             target_model_str = str(target_model)
-            
             current_kwargs = dict(kwargs)
             
             if types:
                 current_config = types.GenerateContentConfig()
                 if base_config:
-                    for attr in ['temperature', 'top_p', 'top_k', 'candidate_count', 'max_output_tokens', 'stop_sequences', 'response_mime_type', 'response_schema', 'system_instruction', 'tools']:
+                    for attr in ['candidate_count', 'max_output_tokens', 'stop_sequences', 'response_mime_type', 'response_schema', 'tools']:
                         if hasattr(base_config, attr) and getattr(base_config, attr) is not None:
                             setattr(current_config, attr, getattr(base_config, attr))
                             
-                if max_tokens:
-                    current_config.max_output_tokens = int(max_tokens)
+                if max_tokens: current_config.max_output_tokens = int(max_tokens)
                 
                 # 🚀 INJECT THINKING CONFIG EXCLUSIVELY FOR 3.1-PRO
                 if "3.1-pro" in target_model_str or "3-pro" in target_model_str:
@@ -633,9 +598,12 @@ class ResearchTools:
                 else:
                     current_config.thinking_config = None
                     
-                # 🔥 STRICT JSON ENFORCEMENT FOR GEMINI (Fallback if schema missing)
-                if force_json and not getattr(current_config, "response_schema", None):
-                    current_config.response_mime_type = "application/json"
+                # 🔥 STRICT JSON ENFORCEMENT FOR GEMINI: Temperature MUST be 0.0 for JSON parsing
+                if force_json:
+                    current_config.temperature = 0.0
+                    current_config.system_instruction = sys_msg
+                    if not getattr(current_config, "response_schema", None):
+                        current_config.response_mime_type = "application/json"
                 
                 current_kwargs["config"] = current_config
 
@@ -654,8 +622,7 @@ class ResearchTools:
                 self._record_timing(target_model_str, duration, target_model_str)
 
                 error_str = str(e).lower()
-                if self.verbosity >= 1:
-                    print(f"    ⚠️ [Cascade] '{target_model_str}' failed: {type(e).__name__} - {str(e)[:150]}")
+                if self.verbosity >= 1: print(f"    ⚠️ [Cascade] '{target_model_str}' failed: {type(e).__name__} - {str(e)[:150]}")
                 
                 if ("404" in error_str or "not found" in error_str or 
                     "429" in error_str or "quota" in error_str or 
@@ -664,15 +631,12 @@ class ResearchTools:
                     
                     time.sleep(1.0)
                     if current_idx < len(pool) - 1: 
-                        if self.verbosity >= 1:
-                            print(f"    ➡️ Cascading seamlessly to next model: {pool[current_idx+1]}")
+                        if self.verbosity >= 1: print(f"    ➡️ Cascading seamlessly to next model: {pool[current_idx+1]}")
                         continue
-                    else: 
-                        raise ResourceWarning(f"All models in {pool_name} pool exhausted. Last Error: {e}")
+                    else: raise ResourceWarning(f"All models in {pool_name} pool exhausted. Last Error: {e}")
                 else: 
                     if current_idx < len(pool) - 1:
-                        if self.verbosity >= 1:
-                            print(f"    ➡️ Unrecognized error. Safety cascade to next model: {pool[current_idx+1]}")
+                        if self.verbosity >= 1: print(f"    ➡️ Unrecognized error. Safety cascade to next model: {pool[current_idx+1]}")
                         continue
                     raise e
                     
@@ -684,11 +648,7 @@ class ResearchTools:
             return self._generate_content_local(prompt, **kwargs)
         if types and "config" not in kwargs:
             cfg = types.GenerateContentConfig(response_mime_type="application/json")
-            try:
-                cfg.response_schema = types.Schema(
-                    type=types.Type.ARRAY,
-                    items=types.Schema(type=types.Type.STRING)
-                )
+            try: cfg.response_schema = types.Schema(type=types.Type.ARRAY, items=types.Schema(type=types.Type.STRING))
             except Exception: pass
             kwargs["config"] = cfg
         return self._generate_content_cascade("PRO", prompt, force_json=True, **kwargs)
@@ -715,8 +675,7 @@ class ResearchTools:
                                 required=["dataset_name", "type", "confidence", "rationale"]
                             )
                         )
-                    },
-                    required=["discovered_datasets"]
+                    }, required=["discovered_datasets"]
                 )
             except Exception: pass
             kwargs["config"] = cfg
@@ -726,8 +685,7 @@ class ResearchTools:
     def generate_content_standard(self, model_name, prompt, **kwargs):
         if getattr(self.config, 'LLM_BACKEND', '') in ["LOCAL_PRO", "LOCAL_CLASSROOM"] and (hasattr(self.models, 'LOCAL_MODEL') or getattr(self.config, 'USE_vLLM', False)):
             return self._generate_content_local(prompt, **kwargs)
-        if types and "config" not in kwargs: 
-            kwargs["config"] = types.GenerateContentConfig(response_mime_type="application/json")
+        if types and "config" not in kwargs: kwargs["config"] = types.GenerateContentConfig(response_mime_type="application/json")
         return self._generate_content_cascade("PRO", prompt, force_json=True, **kwargs)
 
     @profiler.track("LLM: RAG")
@@ -743,8 +701,7 @@ class ResearchTools:
                         "value": types.Schema(type=types.Type.STRING),
                         "confidence": types.Schema(type=types.Type.NUMBER),
                         "rationale": types.Schema(type=types.Type.STRING)
-                    },
-                    required=["value", "confidence", "rationale"]
+                    }, required=["value", "confidence", "rationale"]
                 )
             except Exception: pass
             kwargs["config"] = cfg
@@ -848,7 +805,7 @@ class ResearchTools:
 
         # 4. GEMINI ROUTE (Cascade Default)
         if types:
-            cfg = types.GenerateContentConfig(max_output_tokens=max_t)
+            cfg = types.GenerateContentConfig(max_output_tokens=max_t, temperature=0.0, system_instruction=sys_msg)
             if force_json:
                 cfg.response_mime_type = "application/json"
                 try:
@@ -858,12 +815,12 @@ class ResearchTools:
                             "value": types.Schema(type=types.Type.STRING),
                             "confidence": types.Schema(type=types.Type.NUMBER),
                             "rationale": types.Schema(type=types.Type.STRING)
-                        },
-                        required=["value", "confidence", "rationale"]
+                        }, required=["value", "confidence", "rationale"]
                     )
                 except Exception: pass
             kwargs["config"] = cfg
 
         loop = asyncio.get_running_loop()
         import functools
-        return await loop.run_in_executor(self.thread_pool, functools.partial(self._generate_content_cascade, "FLASH", prompt, force_json=force_json, **kwargs))
+        safe_prompt = f"{sys_msg}\n\n{prompt}"
+        return await loop.run_in_executor(self.thread_pool, functools.partial(self._generate_content_cascade, "FLASH", safe_prompt, force_json=force_json, **kwargs))
