@@ -5,7 +5,7 @@ export VLLM_CONCURRENCY=${3:-16}
 export TARGET_PROJECT=${4:-LOTSA}
 
 export BENCHMARK_MODE="LOCAL"
-export TP_SIZE=4
+export TP_SIZE=4 
 
 if [ "$MODEL_CHOICE" == "cloud" ]; then
     export BENCHMARK_MODE="CLOUD"
@@ -52,37 +52,19 @@ pkill -9 -f run_agent.py >/dev/null 2>&1 || true
 rm -rf /dev/shm/vllm* /dev/shm/nccl* /dev/shm/core* 2>/dev/null
 
 if [ "$BENCHMARK_MODE" == "LOCAL" ]; then
-    MEM_UTIL="0.95"
-    if [ "$LOCAL_MAX_CONTEXT" == "131072" ]; then MEM_UTIL="0.85"; fi
-
-    DOCKER_ARGS=(--model "$LOCAL_MODEL_ID" --tensor-parallel-size "$TP_SIZE" --max-model-len "$LOCAL_MAX_CONTEXT" --enable-prefix-caching --gpu-memory-utilization "$MEM_UTIL" --trust-remote-code --enforce-eager)
-    
+    DOCKER_ARGS=(--model "$LOCAL_MODEL_ID" --tensor-parallel-size "$TP_SIZE" --max-model-len "$LOCAL_MAX_CONTEXT" --enable-prefix-caching --gpu-memory-utilization 0.95 --trust-remote-code --enforce-eager)
     if [ "$MODEL_CHOICE" == "gemma2" ]; then DOCKER_ARGS+=( --rope-scaling '{"type":"dynamic","factor":16.0}' ); fi
 
     echo "🧠 Starting vLLM ($LOCAL_MODEL_ID) | Context: $LOCAL_MAX_CONTEXT | Concurrency: $VLLM_CONCURRENCY | TP: $TP_SIZE..."
-    
     docker run -e VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 -d --name vllm_engine --gpus all --shm-size 32g -e NVIDIA_VISIBLE_DEVICES="0,1,2,4" -e HF_TOKEN="$HF_TOKEN" -v /raid/huggingface_cache:/root/.cache/huggingface -p 8000:8000 --ipc=host vllm/vllm-openai:latest "${DOCKER_ARGS[@]}" > /dev/null
 
-    MAX_WAIT=180 
-    WAITED=0
-    
     echo -n "⏳ Waiting for vLLM to load weights "
     while [ "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8000/health)" != "200" ]; do 
         if [ "$(docker inspect -f '{{.State.Running}}' vllm_engine 2>/dev/null)" == "false" ]; then
-            echo -e "\n\n❌ [FATAL] vLLM Docker container crashed!"
-            docker logs vllm_engine > vllm_crash.log 2>&1
-            tail -n 25 vllm_crash.log
+            echo -e "\n\n❌ [FATAL] vLLM Docker container crashed! (Try lowering Context or Concurrency)."
+            docker logs vllm_engine | tail -n 25
             exit 1
         fi
-        
-        WAITED=$((WAITED + 1))
-        if [ $WAITED -ge $MAX_WAIT ]; then
-            echo -e "\n\n❌ [TIMEOUT] vLLM hung for 15 minutes."
-            docker logs vllm_engine > vllm_crash.log 2>&1
-            docker rm -f vllm_engine >/dev/null 2>&1
-            exit 1
-        fi
-        
         echo -n "."
         sleep 5
     done
@@ -94,4 +76,6 @@ TIMESTAMP=$(date +%Y%m%d_%H%M)
 LOG_FILE="${TARGET_PROJECT}_${MODEL_CHOICE}_Ctx${LOCAL_MAX_CONTEXT}_Con${VLLM_CONCURRENCY}_${TIMESTAMP}.log"
 
 echo "🚀 Starting DeepCollector Benchmark (Saving output to $LOG_FILE)..."
-PYTHONUNBUFFERED=1 python3 run_agent.py 2>&1 | tee "$LOG_FILE"
+
+# 🔥 CRITICAL FIX: PYTHONPATH forces the DGX to load the files you just edited!
+PYTHONPATH="$(pwd)" PYTHONUNBUFFERED=1 python3 run_agent.py 2>&1 | tee "$LOG_FILE"
