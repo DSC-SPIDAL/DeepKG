@@ -1,5 +1,5 @@
 # =============================================================================
-# V282: Research Tools (Bulletproof JSON Payload Isolation)
+# V283: Research Tools (Indestructible JSON Parser)
 # =============================================================================
 import os
 import requests
@@ -11,6 +11,7 @@ import gc
 import traceback
 import asyncio
 import json
+import ast
 import functools
 import concurrent.futures
 import threading
@@ -293,38 +294,55 @@ class ResearchTools:
     def _extract_json_robustly(self, text: str) -> Any:
         if not text or text == "[missing]": return []
         
-        # 🚀 FIX: Bulletproof JSON Payload Isolation
-        # Instead of trying to clean markdown around the text, we search for the absolute boundaries of the JSON object.
-        try:
-            # Find the very first '{' or '['
-            start_obj = text.find('{')
-            start_arr = text.find('[')
+        # 1. Strip external markdown gracefully
+        clean_text = str(text).strip()
+        if clean_text.startswith("```json"): clean_text = clean_text[7:]
+        elif clean_text.startswith("```"): clean_text = clean_text[3:]
+        if clean_text.endswith("```"): clean_text = clean_text[:-3]
+        clean_text = clean_text.strip()
+        
+        # Layer 1: Lenient load (Handles dicts perfectly if no unescaped chars)
+        try: return json.loads(clean_text, strict=False)
+        except Exception: pass
+        
+        # Layer 2: Targeted extraction + Fix Unescaped Newlines
+        start_obj = clean_text.find('{')
+        end_obj = clean_text.rfind('}')
+        if start_obj != -1 and end_obj != -1 and start_obj < end_obj:
+            json_str = clean_text[start_obj:end_obj+1]
+            json_str_clean = re.sub(r'(?<!\\)\n', r'\\n', json_str)
+            try: return json.loads(json_str_clean, strict=False)
+            except Exception:
+                # Layer 3: AST Evaluation (Handles unescaped quotes natively in Python)
+                try:
+                    py_str = json_str.replace('true', 'True').replace('false', 'False').replace('null', 'None')
+                    return ast.literal_eval(py_str)
+                except Exception: pass
+                
+        # Layer 4: Array extraction
+        start_arr = clean_text.find('[')
+        end_arr = clean_text.rfind(']')
+        if start_arr != -1 and end_arr != -1 and start_arr < end_arr:
+            json_str = clean_text[start_arr:end_arr+1]
+            json_str_clean = re.sub(r'(?<!\\)\n', r'\\n', json_str)
+            try: return json.loads(json_str_clean, strict=False)
+            except Exception: pass
             
-            if start_obj != -1 and (start_arr == -1 or start_obj < start_arr):
-                # It's a dictionary. Find the matching closing '}' from the end.
-                end_obj = text.rfind('}')
-                if end_obj != -1:
-                    json_str = text[start_obj:end_obj+1]
-                    return json.loads(json_str)
-            elif start_arr != -1:
-                # It's an array. Find the matching closing ']' from the end.
-                end_arr = text.rfind(']')
-                if end_arr != -1:
-                    json_str = text[start_arr:end_arr+1]
-                    return json.loads(json_str)
-        except Exception:
-            pass # If json.loads fails, fall back to regex extraction
-        
-        # Fallback Regex Extractor if the JSON was massively malformed
+        # Layer 5: Regex Fallback (Indestructible to unescaped quotes/newlines/brackets)
         result = {}
-        val_match = re.search(r'"value"\s*:\s*\x22?([^\x22\}]+)\x22?', text, re.IGNORECASE)
-        conf_match = re.search(r'"confidence"\s*:\s*([\d\.]+)', text, re.IGNORECASE)
-        rat_match = re.search(r'"rationale"\s*:\s*\x22?([^\x22\}]+)\x22?', text, re.IGNORECASE)
-        if val_match: result['value'] = val_match.group(1).strip()
-        if conf_match: result['confidence'] = float(conf_match.group(1))
-        if rat_match: result['rationale'] = rat_match.group(1).strip()
+        val_match = re.search(r'"value"\s*:\s*(.*?)(?:,\s*"confidence"', clean_text, re.IGNORECASE | re.DOTALL)
+        if not val_match: val_match = re.search(r'"value"\s*:\s*(.*?)(?:,\s*"rationale"|\})', clean_text, re.IGNORECASE | re.DOTALL)
+        if val_match: result['value'] = val_match.group(1).strip().strip('"').strip("'")
+            
+        conf_match = re.search(r'"confidence"\s*:\s*([\d\.]+)', clean_text, re.IGNORECASE)
+        if conf_match:
+            try: result['confidence'] = float(conf_match.group(1))
+            except Exception: pass
+            
+        rat_match = re.search(r'"rationale"\s*:\s*(.*?)(?:\})', clean_text, re.IGNORECASE | re.DOTALL)
+        if rat_match: result['rationale'] = rat_match.group(1).strip().strip('"').strip("'")
+            
         if result: return result
-        
         return []
 
     def tool_load_url(self, url: str) -> List[Dict[str, str]]:
@@ -651,4 +669,4 @@ class ResearchTools:
         safe_prompt = f"{sys_msg}\n\n{prompt}"
         return await loop.run_in_executor(self.thread_pool, functools.partial(self._generate_content_cascade, "FLASH", safe_prompt, force_json=force_json, **kwargs))
 
-print("✅ deepcollector/tools/research.py LOADED (V282: Bulletproof JSON Payload Isolation)")
+print("✅ deepcollector/tools/research.py LOADED (V283: Indestructible JSON Parser)")
