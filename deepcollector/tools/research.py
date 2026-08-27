@@ -1,5 +1,5 @@
 # =============================================================================
-# V280: Research Tools (Original Colab ArXiv Logic Restored)
+# V281: Research Tools (Cloud JSON Regex Fix & ArXiv Preserved)
 # =============================================================================
 import os
 import requests
@@ -254,7 +254,6 @@ class ResearchTools:
                 md_links = re.findall(r'\[(.*?)\]\((https?://[^\)]+)\)', text_content)
                 for title, url in md_links: results.append({"url": url.strip(), "title": title.strip(), "content": "Extracted via Markdown", "type": "Gemini Grounding"})
                 
-                # Hex-encoded \x22 and \x27
                 raw_urls = re.findall(r'(https?://[^\s>\x22\x27\)]+)', text_content)
                 for url in raw_urls:
                     clean_url = url.rstrip('.,;:')
@@ -294,10 +293,12 @@ class ResearchTools:
     def _extract_json_robustly(self, text: str) -> Any:
         if not text or text == "[missing]": return []
         text = str(text).strip()
-        text = re.sub(r'^.*?```json\s*', '', text, flags=re.IGNORECASE | re.DOTALL)
-        text = re.sub(r'^.*?```\s*', '', text, flags=re.IGNORECASE | re.DOTALL)
-        text = re.sub(r'\s*```.*$', '', text, flags=re.IGNORECASE | re.DOTALL)
+        
+        # 🚀 FIX: Safe markdown stripping that doesn't delete the JSON payload!
+        text = re.sub(r'```json', '', text, flags=re.IGNORECASE)
+        text = text.replace('```', '')
         text = text.strip()
+        
         start_obj = text.find('{')
         start_arr = text.find('[')
         try:
@@ -308,6 +309,7 @@ class ResearchTools:
                 end_arr = text.rfind(']')
                 if end_arr != -1: return json.loads(text[start_arr:end_arr+1])
         except Exception: pass
+        
         result = {}
         val_match = re.search(r'"value"\s*:\s*\x22?([^\x22\}]+)\x22?', text, re.IGNORECASE)
         conf_match = re.search(r'"confidence"\s*:\s*([\d\.]+)', text, re.IGNORECASE)
@@ -332,7 +334,6 @@ class ResearchTools:
                     search = arxiv.Search(id_list=[paper_id])
                     paper = next(client.results(search))
                     
-                    # Original working Colab resolution
                     target_url = paper.pdf_url.replace("http://", "https://")
 
                     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
@@ -643,4 +644,4 @@ class ResearchTools:
         safe_prompt = f"{sys_msg}\n\n{prompt}"
         return await loop.run_in_executor(self.thread_pool, functools.partial(self._generate_content_cascade, "FLASH", safe_prompt, force_json=force_json, **kwargs))
 
-print("✅ deepcollector/tools/research.py LOADED (V280: Original Colab ArXiv Logic Restored)")
+print("✅ deepcollector/tools/research.py LOADED (V281: Cloud JSON Regex Fix)")
