@@ -1,5 +1,5 @@
 # =============================================================================
-# V281: Research Tools (Cloud JSON Regex Fix & ArXiv Preserved)
+# V282: Research Tools (Bulletproof JSON Payload Isolation)
 # =============================================================================
 import os
 import requests
@@ -292,24 +292,30 @@ class ResearchTools:
 
     def _extract_json_robustly(self, text: str) -> Any:
         if not text or text == "[missing]": return []
-        text = str(text).strip()
         
-        # 🚀 FIX: Safe markdown stripping that doesn't delete the JSON payload!
-        text = re.sub(r'```json', '', text, flags=re.IGNORECASE)
-        text = text.replace('```', '')
-        text = text.strip()
-        
-        start_obj = text.find('{')
-        start_arr = text.find('[')
+        # 🚀 FIX: Bulletproof JSON Payload Isolation
+        # Instead of trying to clean markdown around the text, we search for the absolute boundaries of the JSON object.
         try:
+            # Find the very first '{' or '['
+            start_obj = text.find('{')
+            start_arr = text.find('[')
+            
             if start_obj != -1 and (start_arr == -1 or start_obj < start_arr):
+                # It's a dictionary. Find the matching closing '}' from the end.
                 end_obj = text.rfind('}')
-                if end_obj != -1: return json.loads(text[start_obj:end_obj+1])
+                if end_obj != -1:
+                    json_str = text[start_obj:end_obj+1]
+                    return json.loads(json_str)
             elif start_arr != -1:
+                # It's an array. Find the matching closing ']' from the end.
                 end_arr = text.rfind(']')
-                if end_arr != -1: return json.loads(text[start_arr:end_arr+1])
-        except Exception: pass
+                if end_arr != -1:
+                    json_str = text[start_arr:end_arr+1]
+                    return json.loads(json_str)
+        except Exception:
+            pass # If json.loads fails, fall back to regex extraction
         
+        # Fallback Regex Extractor if the JSON was massively malformed
         result = {}
         val_match = re.search(r'"value"\s*:\s*\x22?([^\x22\}]+)\x22?', text, re.IGNORECASE)
         conf_match = re.search(r'"confidence"\s*:\s*([\d\.]+)', text, re.IGNORECASE)
@@ -318,6 +324,7 @@ class ResearchTools:
         if conf_match: result['confidence'] = float(conf_match.group(1))
         if rat_match: result['rationale'] = rat_match.group(1).strip()
         if result: return result
+        
         return []
 
     def tool_load_url(self, url: str) -> List[Dict[str, str]]:
@@ -644,4 +651,4 @@ class ResearchTools:
         safe_prompt = f"{sys_msg}\n\n{prompt}"
         return await loop.run_in_executor(self.thread_pool, functools.partial(self._generate_content_cascade, "FLASH", safe_prompt, force_json=force_json, **kwargs))
 
-print("✅ deepcollector/tools/research.py LOADED (V281: Cloud JSON Regex Fix)")
+print("✅ deepcollector/tools/research.py LOADED (V282: Bulletproof JSON Payload Isolation)")
