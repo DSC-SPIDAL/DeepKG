@@ -1,5 +1,5 @@
 # =============================================================================
-# V186: Initialization (DGX / Gemma-Compatible & 404 Deprecation Safe)
+# V187: Initialization (Dynamic Target Model Injection & Robust Native Embeddings)
 # =============================================================================
 import os
 import sys
@@ -17,7 +17,6 @@ except ImportError:
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.8,max_split_size_mb:32"
 
-# --- SILENCE NOISY THIRD-PARTY WARNINGS ---
 warnings.filterwarnings("ignore", category=UserWarning, module="google.generativeai")
 warnings.filterwarnings("ignore", category=FutureWarning, module="google.generativeai")
 warnings.filterwarnings("ignore", category=UserWarning, module="transformers")
@@ -34,18 +33,18 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
 
+
 # =============================================================================
 # --- SEARXNG CLIENT ---
 # =============================================================================
 class SearXNGClient:
-    """Robust client for interacting with SearXNG proxy arrays."""
     def __init__(self, base_url="http://localhost:8080"):
         self.base_url = base_url.rstrip("/")
         self.fallback_urls = [
-            "https://searx.be",
-            "https://searx.tiekoetter.com",
-            "https://search.ononoki.org",
-            "https://searx.work"
+            "[https://searx.be](https://searx.be)",
+            "[https://searx.tiekoetter.com](https://searx.tiekoetter.com)",
+            "[https://search.ononoki.org](https://search.ononoki.org)",
+            "[https://searx.work](https://searx.work)"
         ]
 
     def search(self, query: str, max_results: int = 7) -> List[Dict[str, str]]:
@@ -63,7 +62,6 @@ class SearXNGClient:
                 }
 
                 response = requests.get(f"{url}/", params=params, headers=HEADERS, timeout=15)
-
                 if response.status_code == 404:
                     response = requests.get(f"{url}/search", params=params, headers=HEADERS, timeout=15)
 
@@ -80,15 +78,16 @@ class SearXNGClient:
 
                 if results:
                     if url != self.base_url:
-                        print(f"       ⚠️ Localhost 404/Refused. Automatically failed over to public instance: {url}")
+                        print(f"       ⚠️ Localhost 404/Refused. Failed over to public instance: {url}")
                     print(f"       ✅ SearXNG returned {len(results)} usable results.")
                     return results
 
-            except Exception as e:
+            except Exception:
                 continue
 
-        print(f"       ❌ SearXNG Search failed across all attempted instances (Local & Public).")
+        print(f"       ❌ SearXNG Search failed across all attempted instances.")
         return []
+
 
 # =============================================================================
 # --- RETRY STRATEGIES ---
@@ -109,16 +108,14 @@ def get_network_retry_strategy(verbosity=1):
         reraise=True
     )
 
+
 def get_gemini_retry_strategy(verbosity=1):
     from tenacity import retry, stop_after_attempt, wait_exponential
 
     def log_retry(retry_state):
         if verbosity >= 1:
             ex = retry_state.outcome.exception()
-            if ex:
-                msg = str(ex)[:100]
-            else:
-                msg = "Unknown"
+            msg = str(ex)[:100] if ex else "Unknown"
             print(f"    ⚠️ [LLM API] Retry {retry_state.attempt_number}: {msg}...")
 
     return retry(
@@ -127,6 +124,7 @@ def get_gemini_retry_strategy(verbosity=1):
         before_sleep=log_retry,
         reraise=True
     )
+
 
 class SystemMonitor:
     @staticmethod
@@ -141,24 +139,22 @@ class SystemMonitor:
         except Exception:
             pass
 
+
 # =============================================================================
 # --- CORE INITIALIZATION ---
 # =============================================================================
 def initialize_apis(config: Any) -> Tuple[Dict[str, str], Any]:
     keys = {}
-    backend = getattr(config, 'LLM_BACKEND', 'GEMINI')
-    use_vllm = getattr(config, 'USE_vLLM', False)
-
-    # 1. ALWAYS Initialize Gemini (Required for Agentic Planning/Routing)
     api_key = config.SECRETS.get("GEMINI_API_KEY")
     if not api_key:
         try:
             from google.colab import userdata
             api_key = userdata.get("GEMINI_API_KEY")
-        except ImportError:
-            pass
         except Exception:
             pass
+
+    if not api_key:
+        api_key = os.environ.get("GEMINI_API_KEY")
 
     if not api_key:
         print("❌ GEMINI_API_KEY not found in Secrets or Config.")
@@ -171,15 +167,19 @@ def initialize_apis(config: Any) -> Tuple[Dict[str, str], Any]:
         from google import genai
         client = genai.Client(api_key=api_key)
 
-        candidates_pro = [
-            "gemini-3.1-pro-preview",
-            "gemini-2.5-pro"
-        ]
+        target_model = os.environ.get("TARGET_MODEL", "")
+        candidates_pro = ["gemini-3.1-pro-preview", "gemini-2.5-pro"]
+        candidates_flash = ["gemini-3.5-flash", "gemini-2.5-flash"]
 
-        candidates_flash = [
-            "gemini-3.5-flash",
-            "gemini-2.5-flash"
-        ]
+        # Dynamically inject targeted models from environment
+        if target_model and "gemini" in target_model.lower():
+            clean_target = target_model.strip()
+            if "pro" in clean_target:
+                if clean_target not in candidates_pro:
+                    candidates_pro.insert(0, clean_target)
+            else:
+                if clean_target not in candidates_flash:
+                    candidates_flash.insert(0, clean_target)
 
         def verify_pool(model_list, pool_name):
             verified = []
@@ -187,7 +187,6 @@ def initialize_apis(config: Any) -> Tuple[Dict[str, str], Any]:
 
             for model in model_list:
                 try:
-                    # Quick ping to check access permissions
                     client.models.count_tokens(model=model, contents="Test")
                     verified.append(model)
                 except Exception as e:
@@ -223,14 +222,12 @@ def initialize_apis(config: Any) -> Tuple[Dict[str, str], Any]:
 
         class Models:
             CLIENT = client
-            # Use only the verified lists
             PRO_POOL = verified_pro
             FLASH_POOL = verified_flash
 
             CURRENT_PRO_INDEX = 0
             CURRENT_FLASH_INDEX = 0
 
-            # Roles - Defaults to the leader of the verified pool
             MODEL_PLANNER = verified_pro[0]
             MODEL_SYNTHESIZER = verified_pro[0]
             MODEL_STANDARD = verified_flash[0]
@@ -248,6 +245,7 @@ def initialize_apis(config: Any) -> Tuple[Dict[str, str], Any]:
     except Exception as e:
         sys.exit(f"🛑 ABORTING: Failed to initialize Gemini Client: {e}")
 
+
 # -----------------------------------------------------------------------------
 # 5. Native Embedding Class
 # -----------------------------------------------------------------------------
@@ -257,10 +255,6 @@ try:
     from google import genai
 
     class NativeGeminiEmbedding(BaseEmbedding):
-        """
-        Direct wrapper for google-genai SDK embeddings to bypass
-        dependency issues with official llama-index-embeddings-gemini.
-        """
         _client: Any = PrivateAttr()
         _model_name: str = PrivateAttr()
 
@@ -295,6 +289,7 @@ try:
 except ImportError:
     NativeGeminiEmbedding = None
 
+
 # -----------------------------------------------------------------------------
 # 6. LlamaIndex Configuration
 # -----------------------------------------------------------------------------
@@ -311,13 +306,12 @@ def configure_llama_index(config, models, keys) -> bool:
 
         if models and models.FLASH_POOL:
             default_model = models.FLASH_POOL[0]
-            # Safety wrapper for LlamaIndex which strictly expects the "models/" prefix
             if not default_model.startswith("models/"):
                 default_model = f"models/{default_model}"
         else:
             default_model = "models/gemini-2.5-flash"
 
-        llm = Gemini(model_name=default_model, api_key=keys.get("GEMINI", ""), temperature=0.1)
+        llm = Gemini(model_name=default_model, api_key=keys.get("GEMINI", ""), temperature=0.0)
         Settings.llm = llm
 
         active_embed = None
@@ -334,10 +328,7 @@ def configure_llama_index(config, models, keys) -> bool:
             for model_name in embedding_candidates:
                 try:
                     candidate = NativeGeminiEmbedding(api_key=keys.get("GEMINI", ""), model_name=model_name)
-
-                    # Verify it actually works by attempting to embed a short string
                     vec = candidate.get_text_embedding("Startup Verification")
-
                     if vec and len(vec) > 0:
                         active_embed = candidate
                         print(f"      ✅ Selected: {model_name} (via google.genai)")

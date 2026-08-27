@@ -1,5 +1,5 @@
 # =============================================================================
-# V265: Research Tools (Strict Temp 0.0 Lock & SDK Warning Suppression)
+# V266: Research Tools (Strict Pydantic JSON Enforcement & URL Parsing Fix)
 # =============================================================================
 import os
 import requests
@@ -15,8 +15,11 @@ import functools
 import concurrent.futures
 import threading
 import logging
+from collections import defaultdict
+from typing import List, Dict, Any, Optional
+from pydantic import BaseModel, Field
 
-# Suppress new google.genai AFC and API warnings
+# Suppress noisy Google GenAI SDK warnings
 logging.getLogger("google_genai.models").setLevel(logging.ERROR)
 logging.getLogger("google_genai._api_client").setLevel(logging.ERROR)
 
@@ -24,11 +27,6 @@ try:
     import torch
 except ImportError:
     torch = None
-
-from collections import defaultdict
-from typing import List, Dict, Any, Optional
-from tenacity import RetryError
-from requests.exceptions import RequestException, HTTPError, ConnectionError, Timeout, SSLError
 
 try:
     from bs4 import BeautifulSoup
@@ -50,6 +48,30 @@ try:
     from google.genai import types
 except ImportError:
     types = None
+
+
+# -----------------------------------------------------------------------------
+# PYDANTIC SCHEMAS FOR STRUCTURED GEMINI EXTRACTION
+# -----------------------------------------------------------------------------
+class CellExtractionSchema(BaseModel):
+    value: str = Field(description="The extracted value or '[missing]' if not found in context.")
+    confidence: float = Field(description="Confidence score between 0.0 and 1.0.")
+    rationale: str = Field(description="Concise rationale or citation from the text.")
+
+
+class DiscoveredDatasetItem(BaseModel):
+    dataset_name: str = Field(description="Exact canonical or variant name of the dataset.")
+    type: str = Field(description="Entity type: Real-World Dataset, Synthetic Dataset, Collection, or Provider.")
+    confidence: float = Field(description="Relevance confidence score between 0.0 and 1.0.")
+    rationale: str = Field(description="Brief justification for why this dataset belongs to the project.")
+
+
+class DiscoveryCatalogSchema(BaseModel):
+    discovered_datasets: List[DiscoveredDatasetItem] = Field(description="List of all discovered datasets.")
+
+
+class SearchQueriesSchema(BaseModel):
+    queries: List[str] = Field(description="List of targeted search query strings.")
 
 
 class ResearchTools:
@@ -111,17 +133,16 @@ class ResearchTools:
 
     def _fetch_page_content_impl(self, url: str, timeout=15, minimal_cleaning=False) -> str:
         def truncate(text):
-             if len(text) > self.MAX_FETCH_LENGTH:
-                 return text[:self.MAX_FETCH_LENGTH] + "... [TRUNCATED]"
-             return text
+            if len(text) > self.MAX_FETCH_LENGTH:
+                return text[:self.MAX_FETCH_LENGTH] + "... [TRUNCATED]"
+            return text
 
         if url.startswith('/content/drive/') or url.startswith('~'):
             try:
-                import os
                 if os.environ.get("BENCHMARK_MODE") == "LOCAL" and ("PDFGems" in url or "/content/drive/" in url):
                     filename = os.path.basename(url)
                     url = os.path.expanduser(f"~/Desktop/DeepKG/PDFGems/{filename}")
-                
+
                 if not os.path.exists(url):
                     if self.verbosity >= 1: print(f"    ⚠️ [Local Fetch] File not found: {url}")
                     return ""
@@ -135,7 +156,7 @@ class ResearchTools:
                 return ""
         else:
             if "github.com" in url and "/blob/" not in url and "/tree/" not in url:
-                 try:
+                try:
                     parts = url.rstrip('/').split('/')
                     if len(parts) >= 5:
                         user, repo = parts[-2], parts[-1]
@@ -147,8 +168,8 @@ class ResearchTools:
                                     return truncate(response.text)
                             except Exception:
                                 pass
-                 except Exception:
-                     pass
+                except Exception:
+                    pass
 
             if "arxiv.org" in url:
                 url = url.replace("/abs/", "/pdf/").replace("http://", "https://")
@@ -246,7 +267,7 @@ class ResearchTools:
             else:
                 self.search_failure_count += 1
                 if self.verbosity >= 1: print("    ❌ Gemini Search returned 0 usable results.")
-        except Exception as e:
+        except Exception:
             self.search_failure_count += 1
 
         return []
@@ -270,7 +291,10 @@ class ResearchTools:
 
             try:
                 if types:
-                    cfg = types.GenerateContentConfig(tools=[types.Tool(google_search=types.GoogleSearch())])
+                    cfg = types.GenerateContentConfig(
+                        temperature=0.0,
+                        tools=[types.Tool(google_search=types.GoogleSearch())]
+                    )
                     if "3.1-pro" in target_model_str or "3-pro" in target_model_str:
                         cfg.thinking_config = types.ThinkingConfig(thinking_budget=4096)
                 else:
@@ -294,9 +318,9 @@ class ResearchTools:
 
                 raw_urls = re.findall(r'(https?://[^\s>\"\'\)]+)', text_content)
                 for url in raw_urls:
-                        clean_url = url.rstrip('.,;:')
-                        if not any(r['url'] == clean_url for r in results):
-                            results.append({"url": clean_url, "title": "Raw Extracted Link", "content": "Extracted via Omni-Regex", "type": "Gemini Grounding"})
+                    clean_url = url.rstrip('.,;:')
+                    if not any(r['url'] == clean_url for r in results):
+                        results.append({"url": clean_url, "title": "Raw Extracted Link", "content": "Extracted via Omni-Regex", "type": "Gemini Grounding"})
 
                 if not results and response.candidates:
                     cand = response.candidates
@@ -313,20 +337,19 @@ class ResearchTools:
                 duration = time.time() - api_start
                 self._record_timing(target_model_str, duration, tracker_key)
                 error_str = str(e).lower()
-                
+
                 if self.verbosity >= 1:
                     print(f"    ⚠️ [Search Cascade] '{target_model_str}' failed: {type(e).__name__} - {str(e)[:100]}")
-                
+
                 if ("404" in error_str or "not found" in error_str or 
                     "429" in error_str or "quota" in error_str or 
                     "503" in error_str or "timeout" in error_str or 
                     duration > self.SLOW_THRESHOLD_SEC):
-                    
                     time.sleep(1.0)
-                    if current_idx < len(pool) - 1: 
+                    if current_idx < len(pool) - 1:
                         continue
-                    else: return []
-                else: 
+                    return []
+                else:
                     if current_idx < len(pool) - 1: continue
                     return []
         return []
@@ -341,17 +364,17 @@ class ResearchTools:
     def _extract_json_robustly(self, text: str) -> Any:
         if not text or text == "[missing]": return []
         text = str(text).strip()
-        
-        # 1. Aggressively strip chatty prefixes and markdown blocks
+
+        # 1. Clean markdown wrapper tags
         text = re.sub(r'^.*?```json\s*', '', text, flags=re.IGNORECASE | re.DOTALL)
         text = re.sub(r'^.*?```\s*', '', text, flags=re.IGNORECASE | re.DOTALL)
         text = re.sub(r'\s*```.*$', '', text, flags=re.IGNORECASE | re.DOTALL)
         text = text.strip()
 
-        # 2. Find structural boundaries
+        # 2. Structural boundary scan
         start_obj = text.find('{')
         start_arr = text.find('[')
-        
+
         try:
             if start_obj != -1 and (start_arr == -1 or start_obj < start_arr):
                 end_obj = text.rfind('}')
@@ -363,19 +386,18 @@ class ResearchTools:
                     return json.loads(text[start_arr:end_arr+1])
         except Exception:
             pass
-            
-        # 3. Invincible Regex Fallback (Catches poorly escaped strings)
+
+        # 3. Fallback regex field parser
         result = {}
         val_match = re.search(r'"value"\s*:\s*"?([^"\}]+)"?', text, re.IGNORECASE)
         conf_match = re.search(r'"confidence"\s*:\s*([\d\.]+)', text, re.IGNORECASE)
         rat_match = re.search(r'"rationale"\s*:\s*"?([^"\}]+)"?', text, re.IGNORECASE)
-        
+
         if val_match: result['value'] = val_match.group(1).strip()
         if conf_match: result['confidence'] = float(conf_match.group(1))
         if rat_match: result['rationale'] = rat_match.group(1).strip()
-        
+
         if result: return result
-        
         return []
 
     def tool_load_url(self, url: str) -> List[Dict[str, str]]:
@@ -385,7 +407,6 @@ class ResearchTools:
                 paper_id = match.group(1)
                 if self.verbosity >= 1: print(f"\n   📥 [ArXiv Interceptor] Identified {paper_id}. Pulling binary PDF directly...")
                 try:
-                    import requests
                     import io
                     import pypdf
                     target_url = f"[https://arxiv.org/pdf/](https://arxiv.org/pdf/){paper_id}.pdf"
@@ -398,14 +419,15 @@ class ResearchTools:
                             text += (page.extract_text() or "") + "\n"
                         if text and len(text.split()) >= 15:
                             return [{"url": url, "content": text, "title": f"ArXiv Paper {paper_id}", "type": "Direct Load"}]
-                except Exception:
-                    pass
+                except Exception as e:
+                    if self.verbosity >= 1: print(f"   ⚠️ ArXiv direct pull error: {e}")
 
         try:
             content = self._fetch_page_content(url)
             if content and len(content.split()) >= 15:
                 return [{"url": url, "content": content, "title": f"Direct Load: {url[:50]}", "type": "Direct Load"}]
-        except Exception: pass
+        except Exception:
+            pass
         return []
 
     def tool_inspect_data_file(self, url: str, ddi_tool: Any = None) -> Dict:
@@ -434,18 +456,16 @@ class ResearchTools:
                 base_url=os.environ.get("OPENAI_API_BASE", "http://localhost:8000/v1"),
                 max_retries=0, timeout=1200.0 
             )
-            
+
             dc_temp = float(os.environ.get("DC_TEMP", "0.0"))
             dc_tokens = int(os.environ.get("DC_TOKENS", "4096"))
             max_new_tokens = min(kwargs.get("max_new_tokens", dc_tokens), dc_tokens)
             current_prompt = prompt
             force_json = kwargs.get("force_json", False)
-            
+
             sys_msg = (
                 "You are a strict data extraction AI. You MUST output ONLY valid JSON format.\n"
-                "🚨 CRITICAL CAPABILITY TEST: If you find a massive repository (like LOTSA), DO NOT summarize it. "
-                "You MUST extract exactly 15 to 20 representative datasets as individual entries to prove your capabilities. "
-                "Ensure the JSON array is perfectly closed."
+                "Extract requested attributes accurately without conversational filler."
             )
 
             for attempt in range(3):
@@ -454,7 +474,7 @@ class ResearchTools:
                         messages = [{"role": "user", "content": sys_msg + "\n\n" + current_prompt}]
                     else: 
                         messages = [{"role": "system", "content": sys_msg}, {"role": "user", "content": current_prompt}]
-                    
+
                     payload = {
                         "model": model_id,
                         "messages": messages,
@@ -463,7 +483,7 @@ class ResearchTools:
                     }
                     if force_json and "deepseek" not in model_id.lower():
                         payload["response_format"] = {"type": "json_object"}
-                    
+
                     try:
                         response = client.chat.completions.create(**payload)
                     except Exception as api_err:
@@ -472,9 +492,9 @@ class ResearchTools:
                             response = client.chat.completions.create(**payload)
                         else:
                             raise api_err
-                            
+
                     if hasattr(self, '_record_timing'): self._record_timing(model_name_label, time.time() - api_start, model_name_label)
-                    
+
                     raw_res = response.choices[0].message.content
                     clean_res = re.sub(r'<think>.*?</think>', '', raw_res, flags=re.DOTALL)
                     clean_res = clean_res.replace("```json", "").replace("```", "").strip()
@@ -562,7 +582,7 @@ class ResearchTools:
             del prompt
             duration = time.time() - api_start
             self._record_timing(model_name_label, duration, model_name_label)
-            return MockResponseWrapper(response_text.replace("`" * 3 + "json", "").replace("`" * 3, "").strip())
+            return MockResponseWrapper(response_text.replace("```json", "").replace("```", "").strip())
 
     def _generate_content_cascade(self, pool_name: str, prompt: str, **kwargs):
         if not getattr(self.models, 'CLIENT', None): raise ValueError("Gemini Client not initialized.")
@@ -571,40 +591,37 @@ class ResearchTools:
         force_json = kwargs.pop("force_json", False)
         max_tokens = kwargs.pop("max_new_tokens", None)
         base_config = kwargs.pop("config", None)
-        
+
         for k in ["do_sample", "temperature", "top_p", "top_k", "repetition_penalty", "return_dict_in_generate", "output_scores", "stop"]:
             kwargs.pop(k, None)
 
-        # 🔥 Ensure System Message is applied correctly to block chatty behavior
         sys_msg = "You are a strict data extraction AI. You MUST output ONLY valid JSON format without markdown code blocks."
 
         for current_idx, target_model in enumerate(list(pool)):
             api_start = time.time()
             target_model_str = str(target_model)
             current_kwargs = dict(kwargs)
-            
+
             if types:
                 current_config = types.GenerateContentConfig()
                 if base_config:
                     for attr in ['candidate_count', 'max_output_tokens', 'stop_sequences', 'response_mime_type', 'response_schema', 'tools']:
                         if hasattr(base_config, attr) and getattr(base_config, attr) is not None:
                             setattr(current_config, attr, getattr(base_config, attr))
-                            
+
                 if max_tokens: current_config.max_output_tokens = int(max_tokens)
-                
-                # 🚀 INJECT THINKING CONFIG EXCLUSIVELY FOR 3.1-PRO
+
                 if "3.1-pro" in target_model_str or "3-pro" in target_model_str:
                     current_config.thinking_config = types.ThinkingConfig(thinking_budget=4096)
                 else:
                     current_config.thinking_config = None
-                    
-                # 🔥 STRICT JSON ENFORCEMENT FOR GEMINI: Temperature MUST be 0.0 for JSON parsing
-                if force_json:
+
+                # Strict JSON Enforcement: Guarantee JSON MIME Type & Temperature 0.0
+                if force_json or getattr(current_config, "response_schema", None):
                     current_config.temperature = 0.0
+                    current_config.response_mime_type = "application/json"
                     current_config.system_instruction = sys_msg
-                    if not getattr(current_config, "response_schema", None):
-                        current_config.response_mime_type = "application/json"
-                
+
                 current_kwargs["config"] = current_config
 
             try:
@@ -616,19 +633,19 @@ class ResearchTools:
                 duration = time.time() - api_start
                 self._record_timing(target_model_str, duration, target_model_str)
                 return response
-                
+
             except Exception as e:
                 duration = time.time() - api_start
                 self._record_timing(target_model_str, duration, target_model_str)
 
                 error_str = str(e).lower()
                 if self.verbosity >= 1: print(f"    ⚠️ [Cascade] '{target_model_str}' failed: {type(e).__name__} - {str(e)[:150]}")
-                
+
                 if ("404" in error_str or "not found" in error_str or 
                     "429" in error_str or "quota" in error_str or 
                     "503" in error_str or "timeout" in error_str or 
                     duration > self.SLOW_THRESHOLD_SEC):
-                    
+
                     time.sleep(1.0)
                     if current_idx < len(pool) - 1: 
                         if self.verbosity >= 1: print(f"    ➡️ Cascading seamlessly to next model: {pool[current_idx+1]}")
@@ -639,7 +656,7 @@ class ResearchTools:
                         if self.verbosity >= 1: print(f"    ➡️ Unrecognized error. Safety cascade to next model: {pool[current_idx+1]}")
                         continue
                     raise e
-                    
+
         raise ResourceWarning(f"All models in {pool_name} pool exhausted.")
 
     @profiler.track("LLM: Planner")
@@ -647,9 +664,11 @@ class ResearchTools:
         if getattr(self.config, 'LLM_BACKEND', '') in ["LOCAL_PRO", "LOCAL_CLASSROOM"] and (hasattr(self.models, 'LOCAL_MODEL') or getattr(self.config, 'USE_vLLM', False)):
             return self._generate_content_local(prompt, **kwargs)
         if types and "config" not in kwargs:
-            cfg = types.GenerateContentConfig(response_mime_type="application/json")
-            try: cfg.response_schema = types.Schema(type=types.Type.ARRAY, items=types.Schema(type=types.Type.STRING))
-            except Exception: pass
+            cfg = types.GenerateContentConfig(
+                temperature=0.0,
+                response_mime_type="application/json",
+                response_schema=SearchQueriesSchema
+            )
             kwargs["config"] = cfg
         return self._generate_content_cascade("PRO", prompt, force_json=True, **kwargs)
 
@@ -657,27 +676,11 @@ class ResearchTools:
         if getattr(self.config, 'LLM_BACKEND', '') in ["LOCAL_PRO", "LOCAL_CLASSROOM"] and (hasattr(self.models, 'LOCAL_MODEL') or getattr(self.config, 'USE_vLLM', False)):
             return self._generate_content_local(prompt, **kwargs)
         if types and "config" not in kwargs:
-            cfg = types.GenerateContentConfig(response_mime_type="application/json")
-            try:
-                cfg.response_schema = types.Schema(
-                    type=types.Type.OBJECT,
-                    properties={
-                        "discovered_datasets": types.Schema(
-                            type=types.Type.ARRAY,
-                            items=types.Schema(
-                                type=types.Type.OBJECT,
-                                properties={
-                                    "dataset_name": types.Schema(type=types.Type.STRING),
-                                    "type": types.Schema(type=types.Type.STRING),
-                                    "confidence": types.Schema(type=types.Type.NUMBER),
-                                    "rationale": types.Schema(type=types.Type.STRING)
-                                },
-                                required=["dataset_name", "type", "confidence", "rationale"]
-                            )
-                        )
-                    }, required=["discovered_datasets"]
-                )
-            except Exception: pass
+            cfg = types.GenerateContentConfig(
+                temperature=0.0,
+                response_mime_type="application/json",
+                response_schema=DiscoveryCatalogSchema
+            )
             kwargs["config"] = cfg
         return self._generate_content_cascade("PRO", prompt, force_json=True, **kwargs)
 
@@ -685,7 +688,8 @@ class ResearchTools:
     def generate_content_standard(self, model_name, prompt, **kwargs):
         if getattr(self.config, 'LLM_BACKEND', '') in ["LOCAL_PRO", "LOCAL_CLASSROOM"] and (hasattr(self.models, 'LOCAL_MODEL') or getattr(self.config, 'USE_vLLM', False)):
             return self._generate_content_local(prompt, **kwargs)
-        if types and "config" not in kwargs: kwargs["config"] = types.GenerateContentConfig(response_mime_type="application/json")
+        if types and "config" not in kwargs:
+            kwargs["config"] = types.GenerateContentConfig(temperature=0.0, response_mime_type="application/json")
         return self._generate_content_cascade("PRO", prompt, force_json=True, **kwargs)
 
     @profiler.track("LLM: RAG")
@@ -693,17 +697,11 @@ class ResearchTools:
         if getattr(self.config, 'LLM_BACKEND', '') in ["LOCAL_PRO", "LOCAL_CLASSROOM"] and (hasattr(self.models, 'LOCAL_MODEL') or getattr(self.config, 'USE_vLLM', False)):
             return self._generate_content_local(prompt, **kwargs)
         if types and "config" not in kwargs:
-            cfg = types.GenerateContentConfig(response_mime_type="application/json")
-            try:
-                cfg.response_schema = types.Schema(
-                    type=types.Type.OBJECT,
-                    properties={
-                        "value": types.Schema(type=types.Type.STRING),
-                        "confidence": types.Schema(type=types.Type.NUMBER),
-                        "rationale": types.Schema(type=types.Type.STRING)
-                    }, required=["value", "confidence", "rationale"]
-                )
-            except Exception: pass
+            cfg = types.GenerateContentConfig(
+                temperature=0.0,
+                response_mime_type="application/json",
+                response_schema=CellExtractionSchema
+            )
             kwargs["config"] = cfg
         return self._generate_content_cascade("FLASH", prompt, force_json=True, **kwargs)
 
@@ -718,10 +716,10 @@ class ResearchTools:
         model = os.environ.get("TARGET_MODEL", getattr(self.config, 'TARGET_MODEL', ''))
         is_local = getattr(self.config, 'LLM_BACKEND', '') in ["LOCAL_PRO", "LOCAL_CLASSROOM"]
         use_vllm = getattr(self.config, 'USE_vLLM', False) or os.environ.get("DEEPCOLLECTOR_USE_VLLM", "False") == "True"
-        
+
         max_t = kwargs.pop("max_new_tokens", 512)
         force_json = kwargs.pop("force_json", True) 
-        
+
         for bad_k in ["do_sample", "temperature", "top_p", "top_k", "repetition_penalty", "return_dict_in_generate", "output_scores", "stop", "config", "force_json"]:
             kwargs.pop(bad_k, None)
 
@@ -740,18 +738,18 @@ class ResearchTools:
             )
             model_id = os.environ.get("LOCAL_MODEL_ID", "google/gemma-4-31b-it")
             dc_temp = float(os.environ.get("DC_TEMP", "0.0"))
-            
+
             if any(x in model_id.lower() for x in ["gemma-2", "deepseek", "qwen", "llama", "command-r"]): 
                 messages = [{"role": "user", "content": sys_msg + "\n\n" + prompt}]
             else: 
                 messages = [{"role": "system", "content": sys_msg}, {"role": "user", "content": prompt}]
-            
+
             for attempt in range(3):
                 try:
                     payload = {"model": model_id, "messages": messages, "max_tokens": max_t, "temperature": dc_temp}
                     if force_json and "deepseek" not in model_id.lower():
                         payload["response_format"] = {"type": "json_object"}
-                        
+
                     try:
                         resp = await client.chat.completions.create(**payload)
                     except Exception as api_err:
@@ -789,7 +787,7 @@ class ResearchTools:
                     if "429" in str(e).lower() or "quota" in str(e).lower(): await asyncio.sleep((2**attempt)*3 + 2); continue
                     if attempt == 3: raise e
 
-        # 3. ANTHROPIC ROUTE (Direct API)
+        # 3. ANTHROPIC ROUTE
         elif provider == "ANTHROPIC":
             import anthropic
             client = anthropic.AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"], timeout=1800.0)
@@ -803,24 +801,17 @@ class ResearchTools:
                     if "429" in str(e).lower() or "overloaded" in str(e).lower(): await asyncio.sleep((2**attempt)*3 + 2); continue
                     if attempt == 3: raise e
 
-        # 4. GEMINI ROUTE (Cascade Default)
+        # 4. GEMINI ROUTE (Cascade Default with Pydantic Schema)
         if types:
-            cfg = types.GenerateContentConfig(max_output_tokens=max_t, temperature=0.0, system_instruction=sys_msg)
-            if force_json:
-                cfg.response_mime_type = "application/json"
-                try:
-                    cfg.response_schema = types.Schema(
-                        type=types.Type.OBJECT,
-                        properties={
-                            "value": types.Schema(type=types.Type.STRING),
-                            "confidence": types.Schema(type=types.Type.NUMBER),
-                            "rationale": types.Schema(type=types.Type.STRING)
-                        }, required=["value", "confidence", "rationale"]
-                    )
-                except Exception: pass
+            cfg = types.GenerateContentConfig(
+                max_output_tokens=max_t,
+                temperature=0.0,
+                response_mime_type="application/json",
+                response_schema=CellExtractionSchema,
+                system_instruction=sys_msg
+            )
             kwargs["config"] = cfg
 
         loop = asyncio.get_running_loop()
-        import functools
         safe_prompt = f"{sys_msg}\n\n{prompt}"
         return await loop.run_in_executor(self.thread_pool, functools.partial(self._generate_content_cascade, "FLASH", safe_prompt, force_json=force_json, **kwargs))

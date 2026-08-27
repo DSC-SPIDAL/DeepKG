@@ -1,5 +1,5 @@
 # =============================================================================
-# V187: RAG Engine (Definitive Extraction Parsing Patch)
+# V188: RAG Engine (Pydantic-Integrated Extraction Engine)
 # =============================================================================
 import os
 import json
@@ -11,7 +11,6 @@ import gc
 import traceback
 import pandas as pd
 import math
-import ast
 from typing import List, Dict, Optional, Tuple, Any, TYPE_CHECKING
 from datetime import datetime
 
@@ -44,10 +43,6 @@ if TYPE_CHECKING:
     from deepcollector.tools.research import ResearchTools
     from deepcollector.config.settings import AppConfig
 
-# Safe markdown constants to prevent UI truncation issues
-MD_JSON = chr(96) * 3 + "json\n"
-MD_END = "\n" + chr(96) * 3
-
 
 class RAGEngine:
     def __init__(self, config: 'AppConfig', tools: 'ResearchTools'):
@@ -74,9 +69,7 @@ class RAGEngine:
             if self.verbosity >= 2: print("    ⚠️ [Discovery] No active vector index found. Skipping discovery.")
             return 0
 
-        is_local = getattr(self.config, 'LLM_BACKEND', '') in ["LOCAL_PRO", "LOCAL_CLASSROOM"]
         retriever = state.get_retriever(similarity_top_k=self.RAG_DISCOVERY_TOP_K, mode="HYBRID")
-
         if not retriever: return 0
 
         query = f"List ALL datasets, archives, benchmarks, and repositories directly related to: '{state.context}'."
@@ -88,8 +81,6 @@ class RAGEngine:
             context = self._format_context(nodes)[:self.RAG_DISCOVERY_MAX_CHARS]
             variant_instruction = "2. **VARIANT MAPPING (Parent-Child):** If you find a dataset collection, list specific variants as SEPARATE dataset entries.\n" if getattr(self.config, 'ENABLE_VARIANT_MAPPING', False) else "2. **EXTRACT LEAF DATASETS:** Your primary goal is to find specific individual datasets.\n"
 
-            json_example = MD_JSON + '{ "discovered_datasets": [{"dataset_name": "Name", "type": "Real-World Dataset", "confidence": 0.95, "rationale": "Is a leaf dataset in..."}] }' + MD_END
-
             prompt = (
                 f"Analyze the target project: '{state.context}'.\n\n"
                 "--- Instructions ---\n"
@@ -97,8 +88,7 @@ class RAGEngine:
                 f"{variant_instruction}"
                 "3. **UNPACK COLLECTIONS:** If a collection/archive is mentioned, list the specific datasets contained within it.\n"
                 "4. **CLASSIFY TYPE / ENTITY TAXONOMY:** Explicitly classify each entry strictly as one of: [Real-World Dataset | Synthetic Dataset | Collection | Provider | Synthetic Generator | Augmentation Tool | Evaluation Script].\n"
-                "5. **Format:** You MUST respond ONLY with a valid JSON block. Do NOT add extra conversational text.\n"
-                f"{json_example}\n"
+                "5. **Format:** Output valid JSON matching the requested schema.\n"
                 "6. **Default Confidence:** 0.95.\n\n"
                 f"--- Context ---\n{context}\n"
             )
@@ -107,7 +97,7 @@ class RAGEngine:
             discovery_limit = getattr(self.config, 'RAG_MAX_NEW_TOKENS', 1536)
             response = self.tools.generate_content_synthesizer(model, prompt, max_new_tokens=discovery_limit)
 
-            if response.text == "[missing]" or response.text == "{}" or response.text == "[]": return 0
+            if not response or response.text in ["[missing]", "{}", "[]"]: return 0
             return self._parse_discovery_response(state, response.text)
 
         except Exception as e:
@@ -162,7 +152,6 @@ class RAGEngine:
 
         except Exception as e:
             if getattr(self.config, '_CUDA_OOM_ABORT', False): raise e
-            pass
         return added
 
     @profiler.track("RAGEngine: Plan Discovery")
@@ -171,7 +160,6 @@ class RAGEngine:
         known_datasets = [i["Dataset Name"]["value"] for i in state.catalog]
         known_str = ", ".join(known_datasets[:20])
 
-        json_example_queries = MD_JSON + '["query 1", "query 2"]' + MD_END
         prompt = (
             f"You are the strategic planner for a data cataloging agent. Target Project Context: {state.context}\n"
             f"Currently Discovered Datasets: {known_str}\n\nInstructions:\n"
@@ -179,18 +167,19 @@ class RAGEngine:
             "2. Determine what is missing. Are there foundational datasets likely used but not yet found?\n"
             "3. **RUTHLESS SCOPE RULE:** Do NOT generate searches for 'related' datasets, later versions, or competitors.\n"
             "4. Generate 3 targeted Google Search queries to find these missing data sources.\n"
-            "5. Format STRICTLY as a JSON list of strings ONLY inside a markdown block:\n"
-            f"{json_example_queries}\n"
         )
 
         try:
             model = self.tools.models.MODEL_PLANNER
             planner_limit = getattr(self.config, 'RAG_MAX_NEW_TOKENS', 512)
             response = self.tools.generate_content_planner(model, prompt, max_new_tokens=planner_limit)
-            if response.text in ["[]", "[missing]"]: return []
+            if not response or response.text in ["[]", "[missing]"]: return []
 
             data = self.tools._extract_json_robustly(response.text)
-            if isinstance(data, list): return [{"type": "search", "query": q} for q in data if isinstance(q, str)]
+            if isinstance(data, dict) and "queries" in data:
+                return [{"type": "search", "query": q} for q in data["queries"] if isinstance(q, str)]
+            elif isinstance(data, list):
+                return [{"type": "search", "query": q} for q in data if isinstance(q, str)]
             return []
         except Exception as e:
             if getattr(self.config, '_CUDA_OOM_ABORT', False): raise e
@@ -220,7 +209,7 @@ class RAGEngine:
         total_cells = len(candidate_cells)
         is_local = getattr(self.config, 'LLM_BACKEND', '') in ["LOCAL_PRO", "LOCAL_CLASSROOM"]
         use_vllm = getattr(self.config, 'USE_vLLM', False) or os.environ.get("DEEPCOLLECTOR_USE_VLLM", "False") == "True"
-        
+
         if is_local and use_vllm: batch_size = int(os.environ.get("VLLM_CONCURRENCY", self.CELLULAR_RAG_BATCH_SIZE))
         elif is_local: batch_size = 1
         else:
@@ -345,12 +334,11 @@ class RAGEngine:
 
                 citation_instruction = "IMPORTANT: Return the FULL academic citation if available." if "citation" in field_name.lower() else ""
                 missing_fallback = "Standard version" if "Comments" in field_name else "[missing]"
-                
+
                 prompt = (
                     f"Query: {base_query}\nTarget Field: {field_name}\nContext:\n{curr_context}\n\n"
                     f"Instructions: Answer strictly based on context. The value MUST be ONLY the raw integer number or concise phrase. Do NOT write conversational sentences. {numeric_instruction} {citation_instruction} {arbitration_instruction} "
-                    f"If not found, set value='{missing_fallback}'.\n"
-                    f"Format EXACTLY as raw JSON without markdown blocks: {{\"value\": \"Extracted Text\", \"confidence\": 0.95, \"rationale\": \"Found in context\"}}"
+                    f"If not found, set value='{missing_fallback}'."
                 )
 
                 extraction_limit = getattr(self.config, 'RAG_MAX_NEW_TOKENS', 512)
@@ -390,10 +378,10 @@ class RAGEngine:
             if is_fill:
                 if state.update_cell_data(d_name, f_name, new_data): fills += 1
             elif is_same:
-                 if new_conf > old_conf: state.update_cell_data(d_name, f_name, new_data)
-                 confirmed += 1
+                if new_conf > old_conf: state.update_cell_data(d_name, f_name, new_data)
+                confirmed += 1
             elif not is_same and new_conf >= old_conf:
-                 if state.update_cell_data(d_name, f_name, new_data): refinements += 1
+                if state.update_cell_data(d_name, f_name, new_data): refinements += 1
         return fills, refinements, confirmed
 
     def _parse_response(self, text, is_json, field_name="", state=None):
@@ -411,10 +399,10 @@ class RAGEngine:
                 if conf > 10.0: conf = conf / 100.0
                 elif conf > 1.0: conf = conf / 10.0
                 conf = min(conf, 1.0)
-                
+
                 rat = data.get('rationale', '')
                 parse_success = True
-                        
+
         if not parse_success and state is not None:
             state.json_parse_errors += 1
 
@@ -468,6 +456,7 @@ class RAGEngine:
             content = n.get_content()[:2000] if hasattr(n, 'get_content') else str(n)[:2000]
             formatted_nodes.append(f"--- Source: {url} ---\n{content}")
         return "\n\n".join(formatted_nodes)
+
 
 class Auditor:
     def __init__(self, config):
