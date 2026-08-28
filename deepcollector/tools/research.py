@@ -1,5 +1,5 @@
 # =============================================================================
-# V284: Research Tools (Slice-Based JSON Extraction for Absolute Zero Errors)
+# V288: Research Tools (Omni-Regex JSON Rescue & Qwen JSON Unlock)
 # =============================================================================
 import os
 import requests
@@ -295,70 +295,80 @@ class ResearchTools:
         if not text or text == "[missing]": return []
         
         clean_text = str(text).strip()
-        if clean_text.startswith("```json"): clean_text = clean_text[7:]
-        elif clean_text.startswith("```"): clean_text = clean_text[3:]
-        if clean_text.endswith("```"): clean_text = clean_text[:-3]
+        
+        # Remove <think> tags completely
+        clean_text = re.sub(r'<think>.*?</think>', '', clean_text, flags=re.DOTALL | re.IGNORECASE).strip()
+        
+        # Remove ALL markdown formatting anywhere in the text unconditionally
+        clean_text = re.sub(r'```(?:json)?\s*', '', clean_text, flags=re.IGNORECASE)
+        clean_text = re.sub(r'\s*```$', '', clean_text, flags=re.IGNORECASE)
         clean_text = clean_text.strip()
         
-        # Layer 1: Strict JSON Parser
+        # 1. Standard Native Clean Parse (Strict=False allows unescaped structural newlines)
         try: return json.loads(clean_text, strict=False)
         except Exception: pass
         
-        # Isolate the core dictionary
+        # 2. Extract specific JSON object or array to filter out any preceding conversational text
         start_obj = clean_text.find('{')
         end_obj = clean_text.rfind('}')
-        if start_obj != -1 and end_obj != -1 and start_obj < end_obj:
+        start_arr = clean_text.find('[')
+        end_arr = clean_text.rfind(']')
+        
+        json_str = ""
+        is_dict = start_obj != -1 and end_obj != -1
+        is_list = start_arr != -1 and end_arr != -1
+        
+        if is_dict and is_list:
+            if start_obj < start_arr and end_obj > end_arr:
+                json_str = clean_text[start_obj:end_obj+1]
+            elif start_arr < start_obj and end_arr > end_obj:
+                json_str = clean_text[start_arr:end_arr+1]
+            else:
+                json_str = clean_text[start_obj:end_obj+1] # fallback to dict
+        elif is_dict:
             json_str = clean_text[start_obj:end_obj+1]
+        elif is_list:
+            json_str = clean_text[start_arr:end_arr+1]
         else:
             json_str = clean_text
             
-        # Layer 2: Escaped Newline Rescue
         try:
-            json_str_clean = re.sub(r'(?<!\\)\n', r'\\n', json_str)
-            return json.loads(json_str_clean, strict=False)
+            # Re-attempt load on snipped block
+            return json.loads(json_str, strict=False)
         except Exception: pass
             
-        # Layer 3: Python AST Evaluation (Immune to single vs double quote mismatch)
+        # 3. Python literal eval for booleans/nulls directly in safe parser
         try:
             py_str = json_str.replace('true', 'True').replace('false', 'False').replace('null', 'None')
             return ast.literal_eval(py_str)
         except Exception: pass
             
-        # 🚀 Layer 4: The Indestructible Key-Slicer
-        # Chops the raw text strictly by the keys. Immune to unescaped quotes, missing commas, or missing brackets.
+        # 4. Fallback Regex Manual Extraction (Highly Resilient against missing formatting)
         result = {}
-        
         def extract_field(key_name, stop_keys):
-            # Locate the key
-            key_match = re.search(rf'"{key_name}"\s*:\s*', json_str, re.IGNORECASE)
+            key_match = re.search(rf'[-*]?\s*[\x22\x27]?{key_name}[\x22\x27]?\s*:\s*', json_str, re.IGNORECASE)
             if not key_match: return None
             
             start_pos = key_match.end()
             end_pos = len(json_str)
             
-            # Find the closest subsequent key to stop at
             for sk in stop_keys:
-                sk_match = re.search(rf',\s*"{sk}"\s*:', json_str[start_pos:], re.IGNORECASE)
+                sk_match = re.search(rf'[,]?\s*[-*]?\s*[\x22\x27]?{sk}[\x22\x27]?\s*:', json_str[start_pos:], re.IGNORECASE)
                 if sk_match:
                     match_pos = start_pos + sk_match.start()
                     if match_pos < end_pos: end_pos = match_pos
             
-            # If no stop keys are left, stop at the final brace
             if end_pos == len(json_str):
                 last_brace = json_str.rfind('}', start_pos)
-                if last_brace != -1:
-                    end_pos = last_brace
+                if last_brace != -1: end_pos = last_brace
                     
             val = json_str[start_pos:end_pos].strip()
-            
-            # Peel off trailing commas and surrounding quotes
             if val.endswith(','): val = val[:-1].strip()
-            if val.startswith('"') and val.endswith('"'): val = val[1:-1]
-            elif val.startswith("'") and val.endswith("'"): val = val[1:-1]
+            if val.startswith('\x22') and val.endswith('\x22'): val = val[1:-1]
+            elif val.startswith('\x27') and val.endswith('\x27'): val = val[1:-1]
             
-            # Clean lingering internal escapes
-            val = val.replace('\\"', '"').replace("\\'", "'").replace('\\n', '\n')
-            return val
+            # Safely transform string boundaries WITHOUT corrupting outer structures
+            return val.replace('\\n', '\n').replace('\\"', '"')
 
         v = extract_field("value", ["confidence", "rationale"])
         c = extract_field("confidence", ["value", "rationale"])
@@ -366,11 +376,17 @@ class ResearchTools:
         
         if v is not None: result['value'] = v
         if c is not None:
-            try: result['confidence'] = float(re.search(r'[\d\.]+', c).group())
+            try: result['confidence'] = float(re.search(r'[\d\.]+', str(c)).group())
             except Exception: result['confidence'] = 0.95
         if r is not None: result['rationale'] = r
         
         if result: return result
+        
+        # 5. Negative Match Inference (if conversational refusal entirely blocks JSON)
+        lower_text = clean_text.lower()
+        if "not mention" in lower_text or "not specif" in lower_text or "not found" in lower_text or "does not contain" in lower_text:
+            return {"value": "[missing]", "confidence": 0.0, "rationale": "Inferred from conversational refusal"}
+            
         return []
 
     def tool_load_url(self, url: str) -> List[Dict[str, str]]:
@@ -419,7 +435,14 @@ class ResearchTools:
 
     def _generate_content_local(self, prompt: str, **kwargs):
         is_vllm = getattr(self.config, 'USE_vLLM', False) or os.environ.get("DEEPCOLLECTOR_USE_VLLM", "False") == "True"
-        sys_msg = "You are a strict data extraction AI. You MUST output ONLY valid JSON format.\nExtract requested attributes accurately without conversational filler."
+        
+        sys_msg = (
+            "You are a strict data extraction AI. You MUST output ONLY a raw JSON dictionary.\n"
+            "If the information is missing from the text, you MUST output EXACTLY: "
+            "{\"value\": \"[missing]\", \"confidence\": 0.0, \"rationale\": \"Not found in context.\"}\n"
+            "NEVER write conversational sentences. NEVER apologize. ONLY return the JSON block."
+        )
+        
         if is_vllm:
             import openai
             api_start = time.time()
@@ -442,8 +465,11 @@ class ResearchTools:
                         messages = [{"role": "system", "content": sys_msg}, {"role": "user", "content": current_prompt}]
                     
                     payload = {"model": model_id, "messages": messages, "max_tokens": max_new_tokens, "temperature": dc_temp}
-                    if force_json and not any(x in model_id.lower() for x in ["deepseek", "command-r", "qwen"]):
+                    
+                    # 🎯 CRITICAL FIX: Qwen is removed from the blacklist so it correctly utilizes vLLM json_object decoding
+                    if force_json and not any(x in model_id.lower() for x in ["deepseek", "command-r"]):
                         payload["response_format"] = {"type": "json_object"}
+                        
                     try: response = client.chat.completions.create(**payload)
                     except Exception as api_err:
                         if "format" in str(api_err).lower() or "json" in str(api_err).lower() or "400" in str(api_err).lower():
@@ -453,7 +479,7 @@ class ResearchTools:
 
                     if hasattr(self, '_record_timing'): self._record_timing(model_name_label, time.time() - api_start, model_name_label)
                     raw_res = response.choices[0].message.content
-                    clean_res = re.sub(r'<think>.*?</think>', '', raw_res, flags=re.DOTALL)
+                    clean_res = re.sub(r'<think>.*?</think>', '', raw_res, flags=re.DOTALL | re.IGNORECASE)
                     clean_res = clean_res.replace("```json", "").replace("```", "").strip()
                     return MockResponseWrapper(clean_res)
                 except Exception as e:
@@ -615,7 +641,15 @@ class ResearchTools:
         max_t = kwargs.pop("max_new_tokens", 512)
         force_json = kwargs.pop("force_json", True) 
         for bad_k in ["do_sample", "temperature", "top_p", "top_k", "repetition_penalty", "return_dict_in_generate", "output_scores", "stop", "config", "force_json"]: kwargs.pop(bad_k, None)
-        sys_msg = "You are a strict data extraction AI. You MUST output ONLY valid JSON format without markdown code blocks."
+        
+        sys_msg = (
+            "You are a strict data extraction AI. You MUST output ONLY a valid JSON dictionary.\n"
+            "Do NOT wrap the JSON in Markdown (no ```json ... ```).\n"
+            "If the information is missing from the text, you MUST output EXACTLY:\n"
+            "{\"value\": \"[missing]\", \"confidence\": 0.0, \"rationale\": \"Not found in context.\"}\n"
+            "NEVER write conversational sentences. NEVER apologize. ONLY return the raw JSON object."
+        )
+
         class MockResp:
             def __init__(self, text): self.text = text
         api_start = time.time()
@@ -632,7 +666,7 @@ class ResearchTools:
             for attempt in range(3):
                 try:
                     payload = {"model": model_id, "messages": messages, "max_tokens": max_t, "temperature": dc_temp}
-                    if force_json and not any(x in model_id.lower() for x in ["deepseek", "command-r", "qwen"]): payload["response_format"] = {"type": "json_object"}
+                    if force_json and not any(x in model_id.lower() for x in ["deepseek", "command-r"]): payload["response_format"] = {"type": "json_object"}
                     try: resp = await client.chat.completions.create(**payload)
                     except Exception as api_err:
                         if "format" in str(api_err).lower() or "json" in str(api_err).lower() or "400" in str(api_err).lower():
@@ -640,7 +674,7 @@ class ResearchTools:
                             resp = await client.chat.completions.create(**payload)
                         else: raise api_err
                     self._record_timing(f"vLLM ({model_id})", time.time() - api_start, f"vLLM ({model_id})")
-                    clean_res = re.sub(r'<think>.*?</think>', '', resp.choices[0].message.content, flags=re.DOTALL)
+                    clean_res = re.sub(r'<think>.*?</think>', '', resp.choices[0].message.content, flags=re.DOTALL | re.IGNORECASE)
                     return MockResp(clean_res.replace("```json", "").replace("```", "").strip())
                 except Exception as e:
                     if "context length" in str(e).lower() or "input_tokens" in str(e).lower():
@@ -697,4 +731,4 @@ class ResearchTools:
         safe_prompt = f"{sys_msg}\n\n{prompt}"
         return await loop.run_in_executor(self.thread_pool, functools.partial(self._generate_content_cascade, "FLASH", safe_prompt, force_json=force_json, **kwargs))
 
-print("✅ deepcollector/tools/research.py LOADED (V284: Slice-Based JSON Extraction)")
+print("✅ deepcollector/tools/research.py LOADED (V288: JSON Parser Fix & Prompt Hardening)")

@@ -1,5 +1,5 @@
 # =============================================================================
-# V199: RAG Engine (Clean Architecture + JSON Prompting)
+# V200: RAG Engine (List Wrapper Defusal & Cloud Schema Cleanup)
 # =============================================================================
 import os
 import json
@@ -342,21 +342,37 @@ class RAGEngine:
                 if state.update_cell_data(d_name, f_name, new_data): refinements += 1
         return fills, refinements, confirmed
 
+    # 🎯 CRITICAL FIX: Gracefully unwraps List formats and Gemini specific nested JSON artifacts
     def _parse_response(self, text, is_json, field_name="", state=None):
         val, conf, rat, parse_success = "[missing]", 0.0, "JSON Parse Error", False
         if is_json:
             data = self.tools._extract_json_robustly(text)
-            if isinstance(data, dict) and "value" in data:
-                val = data.get('value', '[missing]')
-                if isinstance(val, list): val = ", ".join([str(v).strip() for v in val if v])
-                elif isinstance(val, dict): val = str(val)
-                val = re.sub(r'[\r\n]+', ' ', str(val).strip())
-                conf = float(data.get('confidence', 0.0))
-                if conf > 10.0: conf = conf / 100.0
-                elif conf > 1.0: conf = conf / 10.0
-                conf = min(conf, 1.0)
-                rat = data.get('rationale', '')
-                parse_success = True
+            
+            if isinstance(data, list) and len(data) > 0:
+                if isinstance(data[0], dict):
+                    data = data[0]
+                    
+            if isinstance(data, dict):
+                # Clean nested schema artifacts (Gemini 3.5 Flash Bias)
+                if "CellExtractionSchema" in data and isinstance(data["CellExtractionSchema"], dict):
+                    data = data["CellExtractionSchema"]
+                elif "cell_data" in data and isinstance(data["cell_data"], dict):
+                    data = data["cell_data"]
+                
+                if "value" in data:
+                    val = data.get('value', '[missing]')
+                    if isinstance(val, list): val = ", ".join([str(v).strip() for v in val if v])
+                    elif isinstance(val, dict): val = str(val)
+                    val = re.sub(r'[\r\n]+', ' ', str(val).strip())
+                    try:
+                        conf = float(data.get('confidence', 0.0))
+                    except:
+                        conf = 0.0
+                    if conf > 10.0: conf = conf / 100.0
+                    elif conf > 1.0: conf = conf / 10.0
+                    conf = min(conf, 1.0)
+                    rat = data.get('rationale', '')
+                    parse_success = True
         
         if not parse_success and state is not None: state.json_parse_errors += 1
         
@@ -420,4 +436,4 @@ class Auditor:
         if CellData != dict: data = CellData(**data)
         return RAGResult(cell_data=data, potential_sources=srcs)
 
-print("✅ deepcollector/core/rag_engine.py LOADED (V199: Original Architecture + JSON)")
+print("✅ deepcollector/core/rag_engine.py LOADED (V200: List Wrapper Defusal & Cloud Schema Cleanup)")

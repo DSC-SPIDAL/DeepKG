@@ -1,5 +1,5 @@
 # =============================================================================
-# V93: Settings (vLLM Extreme Throughput Configuration)
+# V94: Settings (Dynamic Deep Research Parity Fix)
 # =============================================================================
 import os
 import re
@@ -100,16 +100,9 @@ class AppConfig:
     SEARCH_NUM_RESULTS: int = 7
 
     # --- CONFIGURABLE DRIVE LOCATIONS ---
-    # 1. Folder for Spreadsheet/Catalog CSV Exports
     GOOGLE_DRIVE_SHEET_FOLDER_ID: str = "15nvgAVcvoigcQUyla9T9A66KDdj7ZPoK"
-
-    # 2. Folder for System/Console Logs
     GOOGLE_DRIVE_LOG_FOLDER_ID: str = "1mw42keL9BNmaNgrW_ssDFGxe8_lcXBQ2"
-
-    # 3. Knowledge Injection Registry Doc
     KNOWLEDGE_MASTER_DOC_URL: str = "https://docs.google.com/document/d/16oN5NyOC2lFBQvLgept4y9yiTUbgKqiz-mLRXnokefw/export?format=html"
-
-    # 4. Deep Research Model Target
     DEEP_RESEARCH_AGENT_MODEL: str = "deep-research-pro-preview-12-2025"
 
     # --- RAG TUNING PARAMETERS (Context Window Management) ---
@@ -119,7 +112,6 @@ class AppConfig:
     RAG_CELLULAR_MAX_CHARS: int = 35000
     RAG_CELLULAR_FALLBACK_CHARS: int = 15000
 
-# ADD THIS LINE: Dynamically inherit from bash script, fallback to 512
     RAG_MAX_NEW_TOKENS: int = int(os.environ.get("DC_TOKENS", "512"))
 
     # --- Deep Research Settings ---
@@ -129,7 +121,9 @@ class AppConfig:
     ABORT_ON_DEEP_RESEARCH_FAILURE: bool = True
     FORCE_ASYNC_POLLING: bool = False
     DEEP_RESEARCH_POLLING_INTERVAL_SECONDS: int = 15
-    ENABLE_LOCAL_DEEP_RESEARCH: bool = True
+    
+    # 🎯 CRITICAL FIX: Dynamically read from the bash environment.
+    ENABLE_LOCAL_DEEP_RESEARCH: bool = os.environ.get("ENABLE_LOCAL_DEEP_RESEARCH", "True").lower() == "true"
 
     # --- Advanced RAG Engine Features ---
     ENABLE_PREFLIGHT_CRAWLER: bool = True
@@ -139,7 +133,6 @@ class AppConfig:
     ENABLE_MULTI_QUERY_RAG: bool = True
     ENABLE_GOLDEN_FASTPATH: bool = True
 
-    # --- MISSING KWARGS RESTORED HERE ---
     ENABLE_SINGLETON_VERIFICATION: bool = True
     ENABLE_ORACLE_SEARCH: bool = True
     SCRAPING_METHOD: int = 1
@@ -152,7 +145,6 @@ class AppConfig:
     CONFIDENCE_LOCK_THRESHOLD: float = 0.95
     GROUNDING_CONFIDENCE_THRESHOLD: float = 0.90
 
-    # --- Iteration limits (Now configurable via __init__) ---
     MAX_DISCOVERY_ITERATIONS: int = 2
     MAX_GROUNDING_ITERATIONS: int = 3
     MAX_EXTRACTION_ITERATIONS: int = 8
@@ -168,7 +160,6 @@ class AppConfig:
     MAX_DOWNLOAD_ARCHIVE_BYTES: int = 1024 * 1024 * 50
     INCLUDE_RAG_TELEMETRY_IN_REPORT: bool = False
 
-    # --- Runtime Flags ---
     IN_COLAB: bool = False
     GSPREAD_AVAILABLE: bool = False
     LLAMA_INDEX_AVAILABLE: bool = False
@@ -176,7 +167,7 @@ class AppConfig:
     BM25Retriever: Optional[Any] = None
     UCIMLREPO_AVAILABLE: bool = False
     BENCHMARK_MODE: str = os.environ.get("BENCHMARK_MODE", "")
-    APPLY_AMNESIA: bool = os.environ.get("APPLY_AMNESIA", "False") == "True"
+    APPLY_AMNESIA: bool = os.environ.get("APPLY_AMNESIA", "False").lower() == "true"
 
     EXECUTION_ARCHITECTURE: str = field(init=False, default="UNKNOWN")
     GOOGLE_SHEET_KB_ID: Optional[str] = field(init=False, default=None)
@@ -258,7 +249,6 @@ class AppConfig:
             if k == 'SECRETS':
                 report[k] = "[REDACTED FOR SECURITY]"
             elif isinstance(v, type):
-                # Type Serialization fix to prevent JSON crash when writing log
                 report[k] = str(v)
             elif isinstance(v, list) and k in ['KNOWLEDGE_INJECTION_DATA', 'INITIAL_URLS']:
                 report[k] = f"[{len(v)} items]"
@@ -329,14 +319,10 @@ class AppConfig:
     def _extract_sheet_id(self, input_str):
         if not input_str or "YOUR_GOOGLE_SHEET_ID_HERE" in input_str:
             return None
-
         input_str = str(input_str).strip()
         match = re.search(r'/spreadsheets/d/([a-zA-Z0-9-_]+)', input_str)
-
         if match:
             return match.group(1)
-
         if re.match(r'^[a-zA-Z0-9-_]{30,}$', input_str):
             return input_str
-
         return None
