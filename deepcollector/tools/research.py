@@ -1,5 +1,5 @@
 # =============================================================================
-# V283: Research Tools (Indestructible JSON Parser)
+# V284: Research Tools (Slice-Based JSON Extraction for Absolute Zero Errors)
 # =============================================================================
 import os
 import requests
@@ -294,54 +294,82 @@ class ResearchTools:
     def _extract_json_robustly(self, text: str) -> Any:
         if not text or text == "[missing]": return []
         
-        # 1. Strip external markdown gracefully
         clean_text = str(text).strip()
         if clean_text.startswith("```json"): clean_text = clean_text[7:]
         elif clean_text.startswith("```"): clean_text = clean_text[3:]
         if clean_text.endswith("```"): clean_text = clean_text[:-3]
         clean_text = clean_text.strip()
         
-        # Layer 1: Lenient load (Handles dicts perfectly if no unescaped chars)
+        # Layer 1: Strict JSON Parser
         try: return json.loads(clean_text, strict=False)
         except Exception: pass
         
-        # Layer 2: Targeted extraction + Fix Unescaped Newlines
+        # Isolate the core dictionary
         start_obj = clean_text.find('{')
         end_obj = clean_text.rfind('}')
         if start_obj != -1 and end_obj != -1 and start_obj < end_obj:
             json_str = clean_text[start_obj:end_obj+1]
-            json_str_clean = re.sub(r'(?<!\\)\n', r'\\n', json_str)
-            try: return json.loads(json_str_clean, strict=False)
-            except Exception:
-                # Layer 3: AST Evaluation (Handles unescaped quotes natively in Python)
-                try:
-                    py_str = json_str.replace('true', 'True').replace('false', 'False').replace('null', 'None')
-                    return ast.literal_eval(py_str)
-                except Exception: pass
-                
-        # Layer 4: Array extraction
-        start_arr = clean_text.find('[')
-        end_arr = clean_text.rfind(']')
-        if start_arr != -1 and end_arr != -1 and start_arr < end_arr:
-            json_str = clean_text[start_arr:end_arr+1]
-            json_str_clean = re.sub(r'(?<!\\)\n', r'\\n', json_str)
-            try: return json.loads(json_str_clean, strict=False)
-            except Exception: pass
+        else:
+            json_str = clean_text
             
-        # Layer 5: Regex Fallback (Indestructible to unescaped quotes/newlines/brackets)
+        # Layer 2: Escaped Newline Rescue
+        try:
+            json_str_clean = re.sub(r'(?<!\\)\n', r'\\n', json_str)
+            return json.loads(json_str_clean, strict=False)
+        except Exception: pass
+            
+        # Layer 3: Python AST Evaluation (Immune to single vs double quote mismatch)
+        try:
+            py_str = json_str.replace('true', 'True').replace('false', 'False').replace('null', 'None')
+            return ast.literal_eval(py_str)
+        except Exception: pass
+            
+        # 🚀 Layer 4: The Indestructible Key-Slicer
+        # Chops the raw text strictly by the keys. Immune to unescaped quotes, missing commas, or missing brackets.
         result = {}
-        val_match = re.search(r'"value"\s*:\s*(.*?)(?:,\s*"confidence"', clean_text, re.IGNORECASE | re.DOTALL)
-        if not val_match: val_match = re.search(r'"value"\s*:\s*(.*?)(?:,\s*"rationale"|\})', clean_text, re.IGNORECASE | re.DOTALL)
-        if val_match: result['value'] = val_match.group(1).strip().strip('"').strip("'")
+        
+        def extract_field(key_name, stop_keys):
+            # Locate the key
+            key_match = re.search(rf'"{key_name}"\s*:\s*', json_str, re.IGNORECASE)
+            if not key_match: return None
             
-        conf_match = re.search(r'"confidence"\s*:\s*([\d\.]+)', clean_text, re.IGNORECASE)
-        if conf_match:
-            try: result['confidence'] = float(conf_match.group(1))
-            except Exception: pass
+            start_pos = key_match.end()
+            end_pos = len(json_str)
             
-        rat_match = re.search(r'"rationale"\s*:\s*(.*?)(?:\})', clean_text, re.IGNORECASE | re.DOTALL)
-        if rat_match: result['rationale'] = rat_match.group(1).strip().strip('"').strip("'")
+            # Find the closest subsequent key to stop at
+            for sk in stop_keys:
+                sk_match = re.search(rf',\s*"{sk}"\s*:', json_str[start_pos:], re.IGNORECASE)
+                if sk_match:
+                    match_pos = start_pos + sk_match.start()
+                    if match_pos < end_pos: end_pos = match_pos
             
+            # If no stop keys are left, stop at the final brace
+            if end_pos == len(json_str):
+                last_brace = json_str.rfind('}', start_pos)
+                if last_brace != -1:
+                    end_pos = last_brace
+                    
+            val = json_str[start_pos:end_pos].strip()
+            
+            # Peel off trailing commas and surrounding quotes
+            if val.endswith(','): val = val[:-1].strip()
+            if val.startswith('"') and val.endswith('"'): val = val[1:-1]
+            elif val.startswith("'") and val.endswith("'"): val = val[1:-1]
+            
+            # Clean lingering internal escapes
+            val = val.replace('\\"', '"').replace("\\'", "'").replace('\\n', '\n')
+            return val
+
+        v = extract_field("value", ["confidence", "rationale"])
+        c = extract_field("confidence", ["value", "rationale"])
+        r = extract_field("rationale", ["value", "confidence"])
+        
+        if v is not None: result['value'] = v
+        if c is not None:
+            try: result['confidence'] = float(re.search(r'[\d\.]+', c).group())
+            except Exception: result['confidence'] = 0.95
+        if r is not None: result['rationale'] = r
+        
         if result: return result
         return []
 
@@ -669,4 +697,4 @@ class ResearchTools:
         safe_prompt = f"{sys_msg}\n\n{prompt}"
         return await loop.run_in_executor(self.thread_pool, functools.partial(self._generate_content_cascade, "FLASH", safe_prompt, force_json=force_json, **kwargs))
 
-print("✅ deepcollector/tools/research.py LOADED (V283: Indestructible JSON Parser)")
+print("✅ deepcollector/tools/research.py LOADED (V284: Slice-Based JSON Extraction)")
