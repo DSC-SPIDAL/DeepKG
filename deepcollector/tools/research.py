@@ -1,5 +1,5 @@
 # =============================================================================
-# V291: Research Tools (Anti-Deadlock Network Patch & JSON Regex Rescue)
+# V293: Research Tools (Zero-Fail JSON Shield & Drive Error Logging)
 # =============================================================================
 import os
 import requests
@@ -66,6 +66,9 @@ class DiscoveryCatalogSchema(BaseModel):
 class SearchQueriesSchema(BaseModel):
     queries: List[str] = Field(description="List of targeted search query strings.")
 
+class MockResponseWrapper:
+    def __init__(self, text):
+        self.text = text
 
 class ResearchTools:
     MAX_FETCH_LENGTH = 1000000
@@ -79,6 +82,7 @@ class ResearchTools:
         self.verbosity = getattr(config, 'VERBOSITY_LEVEL', 1)
         self.thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=30)
         self.search_failure_count = 0
+        self._error_print_count = 0  # To prevent console spam
         self.model_usage_stats = defaultdict(lambda: {"count": 0, "time": 0.0, "time_sq": 0.0})
         self.pool_lock = threading.Lock()
         self.local_llm_lock = threading.Lock()
@@ -113,10 +117,7 @@ class ResearchTools:
             else: self.slow_strikes[t_model_str] = 0
 
     def _safe_sync_call(self, func, timeout_sec, *args, **kwargs):
-        """
-        Anti-Deadlock Kill Switch: Wraps synchronous API calls in a disposable thread.
-        If the network drops and the socket hangs, we abandon the thread and force a TimeoutError.
-        """
+        """Anti-Deadlock Kill Switch for TCP network hangs."""
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         future = executor.submit(func, *args, **kwargs)
         try:
@@ -124,7 +125,6 @@ class ResearchTools:
         except concurrent.futures.TimeoutError:
             raise TimeoutError(f"Network TCP hang detected! Force-killed after {timeout_sec}s.")
         finally:
-            # wait=False ensures we don't block waiting for the deadlocked thread to finish
             executor.shutdown(wait=False)
 
     @profiler.track("Tool: Web Fetching")
@@ -214,7 +214,6 @@ class ResearchTools:
             response = self.generate_content_planner(model, prompt)
             urls = self._extract_json_robustly(response.text)
             
-            # Universal Type Normalizer: extract lists accidentally wrapped in dictionaries
             if isinstance(urls, dict):
                 for v in urls.values():
                     if isinstance(v, list):
@@ -269,7 +268,6 @@ class ResearchTools:
                     if "3.1-pro" in target_model_str or "3-pro" in target_model_str: cfg.thinking_config = types.ThinkingConfig(thinking_budget=4096)
                 else: cfg = None
 
-                # 🔥 V291: Anti-Deadlock Wrapper (45s timeout for Google Search)
                 kwargs_call = {"config": cfg} if cfg else {}
                 response = self._safe_sync_call(
                     self.models.CLIENT.models.generate_content,
@@ -323,23 +321,36 @@ class ResearchTools:
         query = re.sub(r'\s+(with its attributes|with attributes|and provide|details about).*$', '', query, flags=re.IGNORECASE)
         return query.strip()
 
+    def _shielded_json_wrap(self, raw_text: str, prompt: str) -> str:
+        """Forces valid JSON. If extraction completely fails, gracefully packs text into rationale."""
+        extracted = self._extract_json_robustly(raw_text)
+        
+        if not extracted or (isinstance(extracted, list) and len(extracted) == 0):
+            prompt_lower = str(prompt).lower()
+            if "queries" in prompt_lower: 
+                fallback = {"queries": []}
+            elif "discovered_datasets" in prompt_lower: 
+                fallback = {"discovered_datasets": []}
+            else: 
+                safe_text = str(raw_text).replace('"', "'").replace('\n', ' ')[:250]
+                fallback = {"value": "[missing]", "confidence": 0.0, "rationale": f"LLM refused format. RAW: {safe_text}"}
+            return json.dumps(fallback)
+            
+        return json.dumps(extracted)
+
     def _extract_json_robustly(self, text: str) -> Any:
-        if not text or text == "[missing]": return []
+        if not text or str(text).strip() in ["[missing]", ""]: return []
         clean_text = str(text).strip()
         original_raw_text = clean_text
 
-        # Remove <think> tags completely
         clean_text = re.sub(r'<think>.*?</think>', '', clean_text, flags=re.DOTALL | re.IGNORECASE).strip()
 
-        # Extract markdown payload gracefully
         md_match = re.search(r'```(?:json)?\s*(.*?)\s*```', clean_text, flags=re.DOTALL | re.IGNORECASE)
         if md_match:
             clean_text = md_match.group(1).strip()
 
-        # Isolate bounding box (Dict or List)
         start_obj = clean_text.find('{')
         end_obj = clean_text.rfind('}')
-        start_arr = clean_text.find('{')  # Fix: Handle lists safely too
         start_arr = clean_text.find('[')
         end_arr = clean_text.rfind(']')
 
@@ -361,13 +372,11 @@ class ResearchTools:
         else:
             json_str = clean_text
 
-        # Strip structural trailing commas naturally
         json_str = re.sub(r',\s*([\]}])', r'\1', json_str)
 
         try:
             result = json.loads(json_str, strict=False)
             
-            # Auto-Unwrapping Phase (Defeats Nested Schema Hallucinations)
             if isinstance(result, list) and len(result) == 1 and isinstance(result[0], dict): result = result[0]
             if isinstance(result, dict) and len(result) == 1:
                 first_key = list(result.keys())[0]
@@ -377,7 +386,6 @@ class ResearchTools:
             return result
         except Exception: pass
 
-        # Safe python literal eval using word boundaries
         try:
             py_str = re.sub(r'\btrue\b', 'True', json_str, flags=re.IGNORECASE)
             py_str = re.sub(r'\bfalse\b', 'False', py_str, flags=re.IGNORECASE)
@@ -393,40 +401,43 @@ class ResearchTools:
         except Exception: pass
 
         # =========================================================================
-        # RESTORED V291: REGEX FALLBACK MANUAL EXTRACTION (SCHEMA-AWARE)
+        # V293: AGGRESSIVE REGEX EMERGENCY EXTRACTOR (SCHEMA-AWARE)
         # =========================================================================
         result = {}
-        def extract_field(key_name, stop_keys):
-            key_match = re.search(rf'[-*]?\s*[\x22\x27]?{key_name}[\x22\x27]?\s*:\s*', json_str, re.IGNORECASE)
+        def extract_field(key_name, stop_keys, text_target):
+            pattern = rf'(?:["\']|\*\*?)?{key_name}(?:["\']|\*\*?)?\s*[:=]\s*'
+            key_match = re.search(pattern, text_target, re.IGNORECASE)
             if not key_match: return None
 
             start_pos = key_match.end()
-            end_pos = len(json_str)
+            end_pos = len(text_target)
 
             for sk in stop_keys:
-                sk_match = re.search(rf'[,]?\s*[-*]?\s*[\x22\x27]?{sk}[\x22\x27]?\s*:', json_str[start_pos:], re.IGNORECASE)
+                sk_pattern = rf'[,]?\s*\n?\s*[-*#]*\s*(?:["\']|\*\*?)?{sk}(?:["\']|\*\*?)?\s*[:=]\s*'
+                sk_match = re.search(sk_pattern, text_target[start_pos:], re.IGNORECASE)
                 if sk_match:
                     match_pos = start_pos + sk_match.start()
                     if match_pos < end_pos: end_pos = match_pos
 
-            if end_pos == len(json_str):
-                last_brace = json_str.rfind('}', start_pos)
+            if end_pos == len(text_target):
+                last_brace = text_target.rfind('}', start_pos)
                 if last_brace != -1: end_pos = last_brace
 
-            val = json_str[start_pos:end_pos].strip()
+            val = text_target[start_pos:end_pos].strip()
             if val.endswith(','): val = val[:-1].strip()
             if val.startswith('\x22') and val.endswith('\x22'): val = val[1:-1]
             elif val.startswith('\x27') and val.endswith('\x27'): val = val[1:-1]
+            if val.startswith('**') and val.endswith('**'): val = val[2:-2]
 
-            return val.replace('\\n', '\n').replace('\\"', '"')
+            return val.replace('\\n', '\n').replace('\\"', '"').strip()
 
         lower_text = clean_text.lower()
         
         # 1. Check for CellExtractionSchema (RAG)
-        if "value" in lower_text or "rationale" in lower_text:
-            v = extract_field("value", ["confidence", "rationale"])
-            c = extract_field("confidence", ["value", "rationale"])
-            r = extract_field("rationale", ["value", "confidence"])
+        if any(k in lower_text for k in ["value", "confidence", "rationale"]) and "dataset_name" not in lower_text and "queries" not in lower_text:
+            v = extract_field("value", ["confidence", "rationale"], clean_text)
+            c = extract_field("confidence", ["value", "rationale"], clean_text)
+            r = extract_field("rationale", ["value", "confidence"], clean_text)
 
             if v is not None: result['value'] = v
             if c is not None:
@@ -437,25 +448,54 @@ class ResearchTools:
             
         # 2. Check for Search Queries Schema (Planner)
         if "queries" in lower_text:
-            arr_match = re.search(r'\[(.*?)\]', json_str, re.DOTALL)
+            arr_match = re.search(r'\[(.*?)\]', clean_text, re.DOTALL)
             if arr_match:
                 items = re.findall(r'[\x22\x27](.*?)[\x22\x27]', arr_match.group(1))
                 if items: return {"queries": items}
+            # Bullet point fallback
+            bullets = re.findall(r'(?:^|\n)\s*[-*]\s*(.*?)(?=$|\n)', clean_text)
+            if bullets:
+                clean_bullets = [b.strip(' "\'') for b in bullets if len(b)>3]
+                if clean_bullets: return {"queries": clean_bullets}
 
-        # Negative Match Inference
+        # 3. Check for DiscoveryCatalogSchema
+        if "discovered_datasets" in lower_text or "dataset_name" in lower_text:
+            datasets = []
+            blocks = re.findall(r'\{[^{}]*dataset_name[^{}]*\}', clean_text, re.IGNORECASE | re.DOTALL)
+            if not blocks and "dataset_name" in clean_text: blocks = [clean_text] # fallback if braces stripped
+            for b in blocks:
+                name = extract_field("dataset_name", ["type", "confidence", "rationale"], b)
+                typ = extract_field("type", ["dataset_name", "confidence", "rationale"], b)
+                conf = extract_field("confidence", ["dataset_name", "type", "rationale"], b)
+                rat = extract_field("rationale", ["dataset_name", "type", "confidence"], b)
+                
+                if name:
+                    try: c_float = float(re.search(r'[\d\.]+', str(conf)).group()) if conf else 0.90
+                    except: c_float = 0.90
+                    datasets.append({"dataset_name": name, "type": typ or "Unknown", "confidence": c_float, "rationale": rat or ""})
+            if datasets: return {"discovered_datasets": datasets}
+
         if "not mention" in lower_text or "not specif" in lower_text or "not found" in lower_text or "does not contain" in lower_text:
             return {"value": "[missing]", "confidence": 0.0, "rationale": "Inferred from conversational refusal"}
 
         # =========================================================================
-        # 🚨 ERROR LOGGER: Writes unparsable LLM payloads to a file 🚨
+        # 🚨 ERROR LOGGER: Writes to Console + Drive
         # =========================================================================
-        try:
-            with open("json_fatal_errors.log", "a", encoding="utf-8") as f:
-                f.write("\n" + "="*80 + "\n")
-                f.write(f"FAILED TO PARSE JSON:\n")
-                f.write(f"RAW TEXT:\n{original_raw_text}\n")
-                f.write("="*80 + "\n")
-        except Exception: pass
+        error_msg = f"\n\n{'='*80}\n🚨 JSON FATAL ERROR (Captured for Debugging) 🚨\nRAW TEXT:\n{original_raw_text}\n{'='*80}\n"
+        
+        if hasattr(self, '_error_print_count') and getattr(self, '_error_print_count', 0) < 5:
+            print(error_msg, flush=True)
+            self._error_print_count += 1
+            
+        drive_path = "/content/drive/MyDrive/json_fatal_errors.log"
+        if os.path.exists("/content/drive/MyDrive"):
+            try:
+                with open(drive_path, "a", encoding="utf-8") as f: f.write(error_msg)
+            except Exception: pass
+        else:
+            try:
+                with open("json_fatal_errors.log", "a", encoding="utf-8") as f: f.write(error_msg)
+            except Exception: pass
 
         return []
 
@@ -540,7 +580,6 @@ class ResearchTools:
                         payload["response_format"] = {"type": "json_object"}
 
                     try:
-                        # 🔥 V291: Anti-Deadlock Wrapper (120s timeout for local API)
                         response = self._safe_sync_call(client.chat.completions.create, 120.0, **payload)
                     except Exception as api_err:
                         if "format" in str(api_err).lower() or "json" in str(api_err).lower() or "400" in str(api_err).lower():
@@ -550,6 +589,9 @@ class ResearchTools:
 
                     if hasattr(self, '_record_timing'): self._record_timing(model_name_label, time.time() - api_start, model_name_label)
                     raw_res = response.choices[0].message.content
+                    
+                    if force_json: return MockResponseWrapper(self._shielded_json_wrap(raw_res, current_prompt))
+                    
                     clean_res = re.sub(r'<think>.*?</think>', '', raw_res, flags=re.DOTALL | re.IGNORECASE)
                     clean_res = clean_res.replace("```json", "").replace("```", "").strip()
                     return MockResponseWrapper(clean_res)
@@ -626,6 +668,9 @@ class ResearchTools:
             del prompt
             duration = time.time() - api_start
             self._record_timing(model_name_label, duration, model_name_label)
+            
+            force_json = kwargs.get("force_json", False)
+            if force_json: return MockResponseWrapper(self._shielded_json_wrap(response_text, prompt))
             return MockResponseWrapper(response_text.replace("```json", "").replace("```", "").strip())
 
     def _generate_content_cascade(self, pool_name: str, prompt: str, **kwargs):
@@ -654,7 +699,6 @@ class ResearchTools:
                     current_config.system_instruction = sys_msg
                 current_kwargs["config"] = current_config
             try:
-                # 🔥 V291: Anti-Deadlock Wrapper (120s timeout for standard generation)
                 response = self._safe_sync_call(
                     self.models.CLIENT.models.generate_content,
                     120.0,
@@ -665,6 +709,16 @@ class ResearchTools:
                 
                 duration = time.time() - api_start
                 self._record_timing(target_model_str, duration, target_model_str)
+                
+                if force_json and hasattr(response, 'text'):
+                    class MockResponse:
+                        def __init__(self, text, orig):
+                            self.text = text
+                            self.original = orig
+                            if hasattr(orig, 'candidates'): self.candidates = orig.candidates
+                            if hasattr(orig, 'prompt_feedback'): self.prompt_feedback = orig.prompt_feedback
+                    return MockResponse(self._shielded_json_wrap(response.text if response.text else "", prompt), response)
+                    
                 return response
             except Exception as e:
                 duration = time.time() - api_start
@@ -703,7 +757,7 @@ class ResearchTools:
 
     @profiler.track("LLM: RAG")
     def generate_content_rag(self, prompt, **kwargs):
-        if getattr(self.config, 'LLM_BACKEND', '') in ["LOCAL_PRO", "LOCAL_CLASSROOM"] and (hasattr(self.models, 'LOCAL_MODEL') or getattr(self.config, 'USE_vLLM', False)): return self._generate_content_local(prompt, **kwargs)
+        if getattr(self.config, 'LLM_BACKEND', '') in ["LOCAL_PRO", "LOCAL_CLASSROOM"] and (hasattr(self.models, 'LOCAL_MODEL') or getattr(self.config, 'USE_vLLM', False)): return self._generate_content_local(prompt, force_json=True, **kwargs)
         if types and "config" not in kwargs: kwargs["config"] = types.GenerateContentConfig(temperature=0.0, response_mime_type="application/json", response_schema=CellExtractionSchema)
         return self._generate_content_cascade("FLASH", prompt, force_json=True, **kwargs)
 
@@ -746,14 +800,16 @@ class ResearchTools:
                 try:
                     payload = {"model": model_id, "messages": messages, "max_tokens": max_t, "temperature": dc_temp}
                     if force_json and not any(x in model_id.lower() for x in ["deepseek", "command-r"]): payload["response_format"] = {"type": "json_object"}
-                    try: resp = await client.chat.completions.create(**payload)
+                    try: resp = await asyncio.wait_for(client.chat.completions.create(**payload), timeout=120.0)
                     except Exception as api_err:
                         if "format" in str(api_err).lower() or "json" in str(api_err).lower() or "400" in str(api_err).lower():
                             payload.pop("response_format", None)
-                            resp = await client.chat.completions.create(**payload)
+                            resp = await asyncio.wait_for(client.chat.completions.create(**payload), timeout=120.0)
                         else: raise api_err
                     self._record_timing(f"vLLM ({model_id})", time.time() - api_start, f"vLLM ({model_id})")
-                    clean_res = re.sub(r'<think>.*?</think>', '', resp.choices[0].message.content, flags=re.DOTALL | re.IGNORECASE)
+                    raw_res = resp.choices[0].message.content
+                    if force_json: return MockResp(self._shielded_json_wrap(raw_res, prompt))
+                    clean_res = re.sub(r'<think>.*?</think>', '', raw_res, flags=re.DOTALL | re.IGNORECASE)
                     return MockResp(clean_res.replace("```json", "").replace("```", "").strip())
                 except Exception as e:
                     if "context length" in str(e).lower() or "input_tokens" in str(e).lower():
@@ -768,7 +824,7 @@ class ResearchTools:
                         if any(x in model_id.lower() for x in ["gemma-2", "deepseek"]): messages[0]["content"] = sys_msg + "\n\n" + prompt
                         else: messages[1]["content"] = prompt
                         continue
-                    if attempt == 2: return MockResp("[missing]")
+                    if attempt == 2: return MockResp(self._shielded_json_wrap("[missing]", prompt)) if force_json else MockResp("[missing]")
                     await asyncio.sleep(2)
 
         elif provider == "OPENAI":
@@ -779,9 +835,11 @@ class ResearchTools:
                     payload = {"model": model, "messages": [{"role": "system", "content": sys_msg}, {"role": "user", "content": prompt}], "temperature": 0.0, "max_tokens": max_t}
                     if force_json: payload["response_format"] = {"type": "json_object"}
                     if "sol" in model.lower() or "-o" in model.lower(): payload = {"model": model, "messages": [{"role": "user", "content": f"{sys_msg}\n\n{prompt}"}]}
-                    resp = await client.chat.completions.create(**payload)
+                    resp = await asyncio.wait_for(client.chat.completions.create(**payload), timeout=120.0)
                     self._record_timing(model, time.time() - api_start, model)
-                    return MockResp(resp.choices[0].message.content.replace("```json", "").replace("```", "").strip())
+                    raw_res = resp.choices[0].message.content
+                    if force_json: return MockResp(self._shielded_json_wrap(raw_res, prompt))
+                    return MockResp(raw_res.replace("```json", "").replace("```", "").strip())
                 except Exception as e:
                     if "429" in str(e).lower() or "quota" in str(e).lower(): await asyncio.sleep((2**attempt)*3 + 2); continue
                     if attempt == 3: raise e
@@ -791,10 +849,11 @@ class ResearchTools:
             client = anthropic.AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"], timeout=180.0)
             for attempt in range(4):
                 try:
-                    resp = await client.messages.create(model=model, system=sys_msg, messages=[{"role": "user", "content": prompt}], max_tokens=max_t)
+                    resp = await asyncio.wait_for(client.messages.create(model=model, system=sys_msg, messages=[{"role": "user", "content": prompt}], max_tokens=max_t), timeout=120.0)
                     self._record_timing(model, time.time() - api_start, model)
-                    extracted_text = next((block.text for block in resp.content if getattr(block, "type", "") == "text"), "")
-                    return MockResp(extracted_text.replace("```json", "").replace("```", "").strip())
+                    raw_res = next((block.text for block in resp.content if getattr(block, "type", "") == "text"), "")
+                    if force_json: return MockResp(self._shielded_json_wrap(raw_res, prompt))
+                    return MockResp(raw_res.replace("```json", "").replace("```", "").strip())
                 except Exception as e:
                     if "429" in str(e).lower() or "overloaded" in str(e).lower(): await asyncio.sleep((2**attempt)*3 + 2); continue
                     if attempt == 3: raise e
@@ -810,4 +869,4 @@ class ResearchTools:
         safe_prompt = f"{sys_msg}\n\n{prompt}"
         return await loop.run_in_executor(self.thread_pool, functools.partial(self._generate_content_cascade, "FLASH", safe_prompt, force_json=force_json, **kwargs))
 
-print("✅ deepcollector/tools/research.py LOADED (V291: Anti-Deadlock TCP Kill Switch Installed)")
+print("✅ deepcollector/tools/research.py LOADED (V293: Zero-Fail JSON Shield Active)")
