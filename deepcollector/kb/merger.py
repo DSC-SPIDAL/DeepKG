@@ -1,5 +1,5 @@
 # =============================================================================
-# V58.19: Project Merger (Regex Rescue Safety Net & Error Logging)
+# V58.21: Project Merger (Anti-Deadlock TCP Hang Protection & Logging)
 # =============================================================================
 import pandas as pd
 import difflib
@@ -7,6 +7,7 @@ import re
 import json
 import time
 import sys
+import concurrent.futures
 from collections import defaultdict
 from typing import Dict, Tuple, List, Any
 from tabulate import tabulate
@@ -40,6 +41,20 @@ class UniversalOracle:
         self.STOP_WORDS = {"dataset", "data", "benchmark", "collection", "repository", "archive", "series", "time", "prediction", "forecasting", "competition"}
         self.GENERIC_URLS = ["search", "query", "google.com", "bing.com", "kaggle.com", "archive.ics.uci.edu", "zenodo.org", "github.com", "timeseriesclassification.com", "huggingface.co", "hf.co"]
         self.DISCRIMINATORS = {"france", "belgium", "germany", "spain", "italy", "uk", "usa", "china", "japan", "australia", "nord", "pjm", "california", "texas", "ny", "london", "ottawa", "halifax", "hourly", "daily", "weekly", "monthly", "yearly", "minute", "second", "test", "train", "val", "validation", "small", "large", "full", "subset", "np", "de", "fr", "be", "es", "it", "pems03", "pems04", "pems07", "pems08", "m1", "m3", "m4", "m5", "gef12", "gfc12", "gfc14", "gfc17"}
+
+    # =========================================================================
+    # V58.21 ANTI-HANG INTERCEPTOR (Prevents Zombie Connections from killing DGX)
+    # =========================================================================
+    def _safe_sync_call(self, func, timeout_sec, *args, **kwargs):
+        """Wraps API calls in a disposable thread to kill TCP socket deadlocks."""
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(func, *args, **kwargs)
+        try:
+            return future.result(timeout=timeout_sec)
+        except concurrent.futures.TimeoutError:
+            raise TimeoutError(f"Network TCP hang detected! Force-killed after {timeout_sec}s.")
+        finally:
+            executor.shutdown(wait=False)
 
     def _call_llm_with_cascade(self, prompt: str, pool_preference: str = "FLASH", **kwargs) -> str:
         if not self.models or not getattr(self.models, 'CLIENT', None):
@@ -75,7 +90,14 @@ class UniversalOracle:
 
                 try:
                     time.sleep(base_sleep)
-                    response = self.models.CLIENT.models.generate_content(**req_kwargs)
+                    
+                    # 🔥 V58.21: Anti-Deadlock Wrapper injected here (120s timeout)
+                    response = self._safe_sync_call(
+                        self.models.CLIENT.models.generate_content,
+                        120.0,
+                        **req_kwargs
+                    )
+                    
                     dur = time.time() - api_start
                     self.model_stats[model_name]["time"] += dur
                     self.model_stats[model_name]["time_sq"] += dur ** 2
@@ -154,7 +176,7 @@ class UniversalOracle:
                 result = json.loads(target, strict=False)
             except Exception: 
                 # =====================================================================
-                # V58.19: REGEX SAFETY NET FOR ORACLE
+                # V58.21: REGEX SAFETY NET FOR ORACLE
                 # =====================================================================
                 target_lower = target.lower()
                 if "is_same" in target_lower:
@@ -399,7 +421,7 @@ class ProjectMerger:
         mode_str = "🚫 DRY RUN" if dry_run else "💾 LIVE"
         scope_str = "🌍 GLOBAL SCAN" if is_global else f"🎯 PROJECT: {project_id}"
         search_str = "🔍 Web Grounding ON" if self.oracle.enable_search else "📖 Closed Book"
-        print(f"\n🤝 STARTING MERGE: {scope_str} [{mode_str}] | {search_str} (V58.19)")
+        print(f"\n🤝 STARTING MERGE: {scope_str} [{mode_str}] | {search_str} (V58.21)")
 
         if not enable_singleton_verification:
             if is_global: print("    🌍 GLOBAL MODE: Bypassing Singleton Project-Relevance Checks (Deduplication Only).")

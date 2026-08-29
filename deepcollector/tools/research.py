@@ -1,5 +1,5 @@
 # =============================================================================
-# V290: Research Tools (Restored Regex Safety Net & Error Logging)
+# V291: Research Tools (Anti-Deadlock Network Patch & JSON Regex Rescue)
 # =============================================================================
 import os
 import requests
@@ -111,6 +111,21 @@ class ResearchTools:
             self.model_usage_stats[t_key_str]["count"] += 1
             if duration > self.SLOW_THRESHOLD_SEC: self.slow_strikes[t_model_str] += 1
             else: self.slow_strikes[t_model_str] = 0
+
+    def _safe_sync_call(self, func, timeout_sec, *args, **kwargs):
+        """
+        Anti-Deadlock Kill Switch: Wraps synchronous API calls in a disposable thread.
+        If the network drops and the socket hangs, we abandon the thread and force a TimeoutError.
+        """
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(func, *args, **kwargs)
+        try:
+            return future.result(timeout=timeout_sec)
+        except concurrent.futures.TimeoutError:
+            raise TimeoutError(f"Network TCP hang detected! Force-killed after {timeout_sec}s.")
+        finally:
+            # wait=False ensures we don't block waiting for the deadlocked thread to finish
+            executor.shutdown(wait=False)
 
     @profiler.track("Tool: Web Fetching")
     def _fetch_page_content(self, url: str, timeout=15, minimal_cleaning=False) -> str:
@@ -254,7 +269,16 @@ class ResearchTools:
                     if "3.1-pro" in target_model_str or "3-pro" in target_model_str: cfg.thinking_config = types.ThinkingConfig(thinking_budget=4096)
                 else: cfg = None
 
-                response = self.models.CLIENT.models.generate_content(model=target_model_str, contents=str(prompt), config=cfg)
+                # 🔥 V291: Anti-Deadlock Wrapper (45s timeout for Google Search)
+                kwargs_call = {"config": cfg} if cfg else {}
+                response = self._safe_sync_call(
+                    self.models.CLIENT.models.generate_content,
+                    45.0,
+                    model=target_model_str,
+                    contents=str(prompt),
+                    **kwargs_call
+                )
+
                 duration = time.time() - api_start
                 self._record_timing(target_model_str, duration, tracker_key)
 
@@ -315,6 +339,7 @@ class ResearchTools:
         # Isolate bounding box (Dict or List)
         start_obj = clean_text.find('{')
         end_obj = clean_text.rfind('}')
+        start_arr = clean_text.find('{')  # Fix: Handle lists safely too
         start_arr = clean_text.find('[')
         end_arr = clean_text.rfind(']')
 
@@ -368,7 +393,7 @@ class ResearchTools:
         except Exception: pass
 
         # =========================================================================
-        # RESTORED V290: REGEX FALLBACK MANUAL EXTRACTION (SCHEMA-AWARE)
+        # RESTORED V291: REGEX FALLBACK MANUAL EXTRACTION (SCHEMA-AWARE)
         # =========================================================================
         result = {}
         def extract_field(key_name, stop_keys):
@@ -514,11 +539,13 @@ class ResearchTools:
                     if force_json and not any(x in model_id.lower() for x in ["deepseek", "command-r"]):
                         payload["response_format"] = {"type": "json_object"}
 
-                    try: response = client.chat.completions.create(**payload)
+                    try:
+                        # 🔥 V291: Anti-Deadlock Wrapper (120s timeout for local API)
+                        response = self._safe_sync_call(client.chat.completions.create, 120.0, **payload)
                     except Exception as api_err:
                         if "format" in str(api_err).lower() or "json" in str(api_err).lower() or "400" in str(api_err).lower():
                             payload.pop("response_format", None)
-                            response = client.chat.completions.create(**payload)
+                            response = self._safe_sync_call(client.chat.completions.create, 120.0, **payload)
                         else: raise api_err
 
                     if hasattr(self, '_record_timing'): self._record_timing(model_name_label, time.time() - api_start, model_name_label)
@@ -627,7 +654,15 @@ class ResearchTools:
                     current_config.system_instruction = sys_msg
                 current_kwargs["config"] = current_config
             try:
-                response = self.models.CLIENT.models.generate_content(model=target_model_str, contents=str(prompt), **current_kwargs)
+                # 🔥 V291: Anti-Deadlock Wrapper (120s timeout for standard generation)
+                response = self._safe_sync_call(
+                    self.models.CLIENT.models.generate_content,
+                    120.0,
+                    model=target_model_str,
+                    contents=str(prompt),
+                    **current_kwargs
+                )
+                
                 duration = time.time() - api_start
                 self._record_timing(target_model_str, duration, target_model_str)
                 return response
@@ -700,7 +735,7 @@ class ResearchTools:
 
         if is_local and use_vllm:
             import openai
-            client = openai.AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY", "sk-vllm-dummy-key"), base_url=os.environ.get("OPENAI_API_BASE", "http://localhost:8000/v1"), max_retries=0, timeout=1200.0)
+            client = openai.AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY", "sk-vllm-dummy-key"), base_url=os.environ.get("OPENAI_API_BASE", "http://localhost:8000/v1"), max_retries=0, timeout=180.0)
             model_id = os.environ.get("LOCAL_MODEL_ID", "google/gemma-4-31b-it")
             dc_temp = float(os.environ.get("DC_TEMP", "0.0"))
 
@@ -738,7 +773,7 @@ class ResearchTools:
 
         elif provider == "OPENAI":
             import openai
-            client = openai.AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"], timeout=1800.0)
+            client = openai.AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"], timeout=180.0)
             for attempt in range(4):
                 try:
                     payload = {"model": model, "messages": [{"role": "system", "content": sys_msg}, {"role": "user", "content": prompt}], "temperature": 0.0, "max_tokens": max_t}
@@ -753,7 +788,7 @@ class ResearchTools:
 
         elif provider == "ANTHROPIC":
             import anthropic
-            client = anthropic.AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"], timeout=1800.0)
+            client = anthropic.AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"], timeout=180.0)
             for attempt in range(4):
                 try:
                     resp = await client.messages.create(model=model, system=sys_msg, messages=[{"role": "user", "content": prompt}], max_tokens=max_t)
@@ -775,4 +810,4 @@ class ResearchTools:
         safe_prompt = f"{sys_msg}\n\n{prompt}"
         return await loop.run_in_executor(self.thread_pool, functools.partial(self._generate_content_cascade, "FLASH", safe_prompt, force_json=force_json, **kwargs))
 
-print("✅ deepcollector/tools/research.py LOADED (V290: Prompts Hardened & Regex Rescue Restored)")
+print("✅ deepcollector/tools/research.py LOADED (V291: Anti-Deadlock TCP Kill Switch Installed)")
