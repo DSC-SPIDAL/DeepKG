@@ -1,5 +1,5 @@
 # =============================================================================
-# V293: Research Tools (Zero-Fail JSON Shield & Drive Error Logging)
+# V296: Research Tools (Token Starvation Override, EOF Healing & Anti-Deadlock)
 # =============================================================================
 import os
 import requests
@@ -82,7 +82,7 @@ class ResearchTools:
         self.verbosity = getattr(config, 'VERBOSITY_LEVEL', 1)
         self.thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=30)
         self.search_failure_count = 0
-        self._error_print_count = 0  # To prevent console spam
+        self._error_print_count = 0
         self.model_usage_stats = defaultdict(lambda: {"count": 0, "time": 0.0, "time_sq": 0.0})
         self.pool_lock = threading.Lock()
         self.local_llm_lock = threading.Lock()
@@ -322,7 +322,7 @@ class ResearchTools:
         return query.strip()
 
     def _shielded_json_wrap(self, raw_text: str, prompt: str) -> str:
-        """Forces valid JSON. If extraction completely fails, gracefully packs text into rationale."""
+        """Forces valid JSON. If extraction fails due to truncation, gracefully packs text into rationale."""
         extracted = self._extract_json_robustly(raw_text)
         
         if not extracted or (isinstance(extracted, list) and len(extracted) == 0):
@@ -333,7 +333,8 @@ class ResearchTools:
                 fallback = {"discovered_datasets": []}
             else: 
                 safe_text = str(raw_text).replace('"', "'").replace('\n', ' ')[:250]
-                fallback = {"value": "[missing]", "confidence": 0.0, "rationale": f"LLM refused format. RAW: {safe_text}"}
+                if not safe_text.strip(): safe_text = "Generation aborted or empty."
+                fallback = {"value": "[missing]", "confidence": 0.0, "rationale": f"API Truncation/Refusal. RAW: {safe_text}"}
             return json.dumps(fallback)
             
         return json.dumps(extracted)
@@ -345,7 +346,7 @@ class ResearchTools:
 
         clean_text = re.sub(r'<think>.*?</think>', '', clean_text, flags=re.DOTALL | re.IGNORECASE).strip()
 
-        md_match = re.search(r'```(?:json)?\s*(.*?)\s*```', clean_text, flags=re.DOTALL | re.IGNORECASE)
+        md_match = re.search(r'```(?:json)?\s*(.*?)\s*(?:```|$)', clean_text, flags=re.DOTALL | re.IGNORECASE)
         if md_match:
             clean_text = md_match.group(1).strip()
 
@@ -355,34 +356,31 @@ class ResearchTools:
         end_arr = clean_text.rfind(']')
 
         json_str = ""
-        is_dict = start_obj != -1 and end_obj != -1 and start_obj <= end_obj
-        is_list = start_arr != -1 and end_arr != -1 and start_arr <= end_arr
+        is_dict = start_obj != -1 
+        is_list = start_arr != -1
 
         if is_dict and is_list:
-            if start_obj < start_arr and end_obj > end_arr:
-                json_str = clean_text[start_obj:end_obj+1]
-            elif start_arr < start_obj and end_arr > end_obj:
-                json_str = clean_text[start_arr:end_arr+1]
-            else:
-                json_str = clean_text[start_obj:end_obj+1]
-        elif is_dict:
-            json_str = clean_text[start_obj:end_obj+1]
-        elif is_list:
-            json_str = clean_text[start_arr:end_arr+1]
-        else:
-            json_str = clean_text
+            if start_obj < start_arr: json_str = clean_text[start_obj:end_obj+1 if end_obj != -1 else len(clean_text)]
+            else: json_str = clean_text[start_arr:end_arr+1 if end_arr != -1 else len(clean_text)]
+        elif is_dict: json_str = clean_text[start_obj:end_obj+1 if end_obj != -1 else len(clean_text)]
+        elif is_list: json_str = clean_text[start_arr:end_arr+1 if end_arr != -1 else len(clean_text)]
+        else: json_str = clean_text
 
         json_str = re.sub(r',\s*([\]}])', r'\1', json_str)
 
         try:
             result = json.loads(json_str, strict=False)
-            
             if isinstance(result, list) and len(result) == 1 and isinstance(result[0], dict): result = result[0]
             if isinstance(result, dict) and len(result) == 1:
                 first_key = list(result.keys())[0]
                 if isinstance(result[first_key], dict) and ("Schema" in first_key or "Oracle" in first_key or "result" in first_key.lower()):
                     result = result[first_key]
-                    
+            
+            # Ensure the parent script never crashes from missing keys
+            if isinstance(result, dict) and ("value" in result or "confidence" in result):
+                if "value" not in result: result["value"] = "[missing]"
+                if "confidence" not in result: result["confidence"] = 0.0
+                if "rationale" not in result: result["rationale"] = "Auto-filled."
             return result
         except Exception: pass
 
@@ -391,7 +389,6 @@ class ResearchTools:
             py_str = re.sub(r'\bfalse\b', 'False', py_str, flags=re.IGNORECASE)
             py_str = re.sub(r'\bnull\b', 'None', py_str, flags=re.IGNORECASE)
             result = ast.literal_eval(py_str)
-            
             if isinstance(result, list) and len(result) == 1 and isinstance(result[0], dict): result = result[0]
             if isinstance(result, dict) and len(result) == 1:
                 first_key = list(result.keys())[0]
@@ -401,7 +398,7 @@ class ResearchTools:
         except Exception: pass
 
         # =========================================================================
-        # V293: AGGRESSIVE REGEX EMERGENCY EXTRACTOR (SCHEMA-AWARE)
+        # V296: AUTO-HEAL REGEX EXTRACTION (Handles Severe Token Truncation)
         # =========================================================================
         result = {}
         def extract_field(key_name, stop_keys, text_target):
@@ -417,6 +414,8 @@ class ResearchTools:
                 sk_match = re.search(sk_pattern, text_target[start_pos:], re.IGNORECASE)
                 if sk_match:
                     match_pos = start_pos + sk_match.start()
+                    while match_pos > start_pos and text_target[match_pos-1] in ' \n\t"\'':
+                        match_pos -= 1
                     if match_pos < end_pos: end_pos = match_pos
 
             if end_pos == len(text_target):
@@ -424,56 +423,77 @@ class ResearchTools:
                 if last_brace != -1: end_pos = last_brace
 
             val = text_target[start_pos:end_pos].strip()
+            
+            # Auto-Repair: Cap broken string quotes caused by token truncation
+            if val.startswith('"') and not val.endswith('"') and '\n' not in val: val += '"'
+            if val.startswith("'") and not val.endswith("'") and '\n' not in val: val += "'"
+
             if val.endswith(','): val = val[:-1].strip()
             if val.startswith('\x22') and val.endswith('\x22'): val = val[1:-1]
             elif val.startswith('\x27') and val.endswith('\x27'): val = val[1:-1]
+            elif val.startswith('\x22'): val = val[1:]  
+            elif val.startswith('\x27'): val = val[1:]
+            
             if val.startswith('**') and val.endswith('**'): val = val[2:-2]
 
             return val.replace('\\n', '\n').replace('\\"', '"').strip()
 
         lower_text = clean_text.lower()
         
-        # 1. Check for CellExtractionSchema (RAG)
-        if any(k in lower_text for k in ["value", "confidence", "rationale"]) and "dataset_name" not in lower_text and "queries" not in lower_text:
+        # 1. Check for CellExtractionSchema
+        if any(k in lower_text for k in ["value", "confidence", "rationale", "missing"]) and "dataset_name" not in lower_text and "queries" not in lower_text:
             v = extract_field("value", ["confidence", "rationale"], clean_text)
             c = extract_field("confidence", ["value", "rationale"], clean_text)
             r = extract_field("rationale", ["value", "confidence"], clean_text)
 
+            # Even if heavily truncated by the API, salvage what we caught
             if v is not None: result['value'] = v
             if c is not None:
                 try: result['confidence'] = float(re.search(r'[\d\.]+', str(c)).group())
-                except Exception: result['confidence'] = 0.95
+                except Exception: result['confidence'] = 0.0
             if r is not None: result['rationale'] = r
-            if result: return result
             
-        # 2. Check for Search Queries Schema (Planner)
+            # Auto-fill missing pieces to satisfy schema completely so it doesn't break parent
+            if result or v is not None or c is not None or r is not None:
+                if "value" not in result: result["value"] = "[missing]"
+                if "confidence" not in result: result["confidence"] = 0.0
+                if "rationale" not in result: result["rationale"] = "Output was truncated by API"
+                return result
+            
+        # 2. Check for Search Queries Schema
         if "queries" in lower_text:
-            arr_match = re.search(r'\[(.*?)\]', clean_text, re.DOTALL)
+            arr_match = re.search(r'\[(.*)', clean_text, re.DOTALL) # Match even without closing brace
             if arr_match:
                 items = re.findall(r'[\x22\x27](.*?)[\x22\x27]', arr_match.group(1))
                 if items: return {"queries": items}
-            # Bullet point fallback
+                
             bullets = re.findall(r'(?:^|\n)\s*[-*]\s*(.*?)(?=$|\n)', clean_text)
             if bullets:
                 clean_bullets = [b.strip(' "\'') for b in bullets if len(b)>3]
                 if clean_bullets: return {"queries": clean_bullets}
+                
+            if '{"queries":' in lower_text: return {"queries": []}
 
-        # 3. Check for DiscoveryCatalogSchema
+        # 3. Check for Discovery Catalog Schema
         if "discovered_datasets" in lower_text or "dataset_name" in lower_text:
             datasets = []
             blocks = re.findall(r'\{[^{}]*dataset_name[^{}]*\}', clean_text, re.IGNORECASE | re.DOTALL)
-            if not blocks and "dataset_name" in clean_text: blocks = [clean_text] # fallback if braces stripped
+            if not blocks and "dataset_name" in clean_text: blocks = [clean_text]
             for b in blocks:
-                name = extract_field("dataset_name", ["type", "confidence", "rationale"], b)
-                typ = extract_field("type", ["dataset_name", "confidence", "rationale"], b)
-                conf = extract_field("confidence", ["dataset_name", "type", "rationale"], b)
-                rat = extract_field("rationale", ["dataset_name", "type", "confidence"], b)
+                n_match = re.search(r'["\']?dataset_name["\']?\s*:\s*["\']?(.*?)(?:["\']?\s*,|\n|$)', b, re.IGNORECASE)
+                t_match = re.search(r'["\']?type["\']?\s*:\s*["\']?(.*?)(?:["\']?\s*,|\n|$)', b, re.IGNORECASE)
+                c_match = re.search(r'["\']?confidence["\']?\s*:\s*([\d\.]+)', b, re.IGNORECASE)
+                r_match = re.search(r'["\']?rationale["\']?\s*:\s*["\']?(.*?)(?:["\']?\s*}|\n|$)', b, re.IGNORECASE | re.DOTALL)
                 
-                if name:
-                    try: c_float = float(re.search(r'[\d\.]+', str(conf)).group()) if conf else 0.90
-                    except: c_float = 0.90
-                    datasets.append({"dataset_name": name, "type": typ or "Unknown", "confidence": c_float, "rationale": rat or ""})
+                if n_match:
+                    name = n_match.group(1).strip()
+                    typ = t_match.group(1).strip() if t_match else "Unknown"
+                    try: conf = float(c_match.group(1)) if c_match else 0.90
+                    except: conf = 0.90
+                    rat = r_match.group(1).strip() if r_match else ""
+                    datasets.append({"dataset_name": name, "type": typ, "confidence": conf, "rationale": rat})
             if datasets: return {"discovered_datasets": datasets}
+            if '{"discovered_datasets":' in lower_text: return {"discovered_datasets": []}
 
         if "not mention" in lower_text or "not specif" in lower_text or "not found" in lower_text or "does not contain" in lower_text:
             return {"value": "[missing]", "confidence": 0.0, "rationale": "Inferred from conversational refusal"}
@@ -562,10 +582,14 @@ class ResearchTools:
                 def __init__(self, text): self.text = text
             client = openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY", "sk-vllm-dummy-key"), base_url=os.environ.get("OPENAI_API_BASE", "http://localhost:8000/v1"), max_retries=0, timeout=1200.0)
             dc_temp = float(os.environ.get("DC_TEMP", "0.0"))
+            
+            # 🔥 V296: Token Expansion Floor protects against user-configured token starvation
             dc_tokens = int(os.environ.get("DC_TOKENS", "4096"))
-            max_new_tokens = min(kwargs.get("max_new_tokens", dc_tokens), dc_tokens)
-            current_prompt = prompt
+            req_new = kwargs.get("max_new_tokens", dc_tokens)
             force_json = kwargs.get("force_json", False)
+            max_new_tokens = max(int(req_new), 1024) if force_json else int(req_new)
+            
+            current_prompt = prompt
 
             for attempt in range(3):
                 try:
@@ -628,7 +652,12 @@ class ResearchTools:
             try: formatted_prompt = tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
             except Exception: formatted_prompt = f"<bos><start_of_turn>user\n{sys_msg}\n\n{prompt}<end_of_turn>\n<start_of_turn>model\n"
             current_max_len = 32000
-            req_max_new = min(kwargs.get("max_new_tokens", 1024), 2048)
+            
+            # 🔥 V296: Token Expansion Floor
+            force_json = kwargs.get("force_json", False)
+            passed_tokens = int(kwargs.get("max_new_tokens", 1024))
+            req_max_new = max(passed_tokens, 1024) if force_json else passed_tokens
+            
             while current_max_len >= 2000:
                 try:
                     if torch is not None and torch.cuda.is_available(): torch.cuda.empty_cache(); torch.cuda.ipc_collect()
@@ -669,7 +698,6 @@ class ResearchTools:
             duration = time.time() - api_start
             self._record_timing(model_name_label, duration, model_name_label)
             
-            force_json = kwargs.get("force_json", False)
             if force_json: return MockResponseWrapper(self._shielded_json_wrap(response_text, prompt))
             return MockResponseWrapper(response_text.replace("```json", "").replace("```", "").strip())
 
@@ -679,25 +707,44 @@ class ResearchTools:
         force_json = kwargs.pop("force_json", False)
         max_tokens = kwargs.pop("max_new_tokens", None)
         base_config = kwargs.pop("config", None)
+        
+        # Stop sequences are wiped to prevent the parent script from artificially truncating the model!
         for k in ["do_sample", "temperature", "top_p", "top_k", "repetition_penalty", "return_dict_in_generate", "output_scores", "stop"]: kwargs.pop(k, None)
+        
         sys_msg = "You are a strict data extraction AI. You MUST output ONLY valid JSON format without markdown code blocks."
+        
         for current_idx, target_model in enumerate(list(pool)):
             api_start = time.time()
             target_model_str = str(target_model)
             current_kwargs = dict(kwargs)
+            
             if types:
                 current_config = types.GenerateContentConfig()
                 if base_config:
-                    for attr in ['candidate_count', 'max_output_tokens', 'stop_sequences', 'response_mime_type', 'response_schema', 'tools']:
-                        if hasattr(base_config, attr) and getattr(base_config, attr) is not None: setattr(current_config, attr, getattr(base_config, attr))
-                if max_tokens: current_config.max_output_tokens = int(max_tokens)
+                    # Disable buggy Google Constrained Decoding Engine entirely!
+                    for attr in ['candidate_count', 'max_output_tokens', 'stop_sequences', 'response_mime_type', 'tools', 'system_instruction']:
+                        if hasattr(base_config, attr) and getattr(base_config, attr) is not None: 
+                            if attr == 'response_schema': continue # Stripped!
+                            setattr(current_config, attr, getattr(base_config, attr))
+                            
+                # 🔥 V296: Intercept Google Cloud token limits. Force to 1024 so JSON arrays aren't aborted mid-stream
+                if max_tokens:
+                    safe_max = max(int(max_tokens), 1024) if force_json else int(max_tokens)
+                    current_config.max_output_tokens = safe_max
+                elif force_json:
+                    current_config.max_output_tokens = 1024
+                    
+                if "discovered_datasets" in prompt.lower(): current_config.max_output_tokens = 2048
+
                 if "3.1-pro" in target_model_str or "3-pro" in target_model_str: current_config.thinking_config = types.ThinkingConfig(thinking_budget=4096)
                 else: current_config.thinking_config = None
-                if force_json or getattr(current_config, "response_schema", None):
+                
+                if force_json:
                     current_config.temperature = 0.0
                     current_config.response_mime_type = "application/json"
                     current_config.system_instruction = sys_msg
                 current_kwargs["config"] = current_config
+                
             try:
                 response = self._safe_sync_call(
                     self.models.CLIENT.models.generate_content,
@@ -741,12 +788,12 @@ class ResearchTools:
     @profiler.track("LLM: Planner")
     def generate_content_planner(self, model_name, prompt, **kwargs):
         if getattr(self.config, 'LLM_BACKEND', '') in ["LOCAL_PRO", "LOCAL_CLASSROOM"] and (hasattr(self.models, 'LOCAL_MODEL') or getattr(self.config, 'USE_vLLM', False)): return self._generate_content_local(prompt, **kwargs)
-        if types and "config" not in kwargs: kwargs["config"] = types.GenerateContentConfig(temperature=0.0, response_mime_type="application/json", response_schema=SearchQueriesSchema)
+        if types and "config" not in kwargs: kwargs["config"] = types.GenerateContentConfig(temperature=0.0, response_mime_type="application/json")
         return self._generate_content_cascade("PRO", prompt, force_json=True, **kwargs)
 
     def generate_content_synthesizer(self, model_name, prompt, **kwargs):
         if getattr(self.config, 'LLM_BACKEND', '') in ["LOCAL_PRO", "LOCAL_CLASSROOM"] and (hasattr(self.models, 'LOCAL_MODEL') or getattr(self.config, 'USE_vLLM', False)): return self._generate_content_local(prompt, **kwargs)
-        if types and "config" not in kwargs: kwargs["config"] = types.GenerateContentConfig(temperature=0.0, response_mime_type="application/json", response_schema=DiscoveryCatalogSchema)
+        if types and "config" not in kwargs: kwargs["config"] = types.GenerateContentConfig(temperature=0.0, response_mime_type="application/json")
         return self._generate_content_cascade("PRO", prompt, force_json=True, **kwargs)
 
     @profiler.track("LLM: Standard")
@@ -758,7 +805,7 @@ class ResearchTools:
     @profiler.track("LLM: RAG")
     def generate_content_rag(self, prompt, **kwargs):
         if getattr(self.config, 'LLM_BACKEND', '') in ["LOCAL_PRO", "LOCAL_CLASSROOM"] and (hasattr(self.models, 'LOCAL_MODEL') or getattr(self.config, 'USE_vLLM', False)): return self._generate_content_local(prompt, force_json=True, **kwargs)
-        if types and "config" not in kwargs: kwargs["config"] = types.GenerateContentConfig(temperature=0.0, response_mime_type="application/json", response_schema=CellExtractionSchema)
+        if types and "config" not in kwargs: kwargs["config"] = types.GenerateContentConfig(temperature=0.0, response_mime_type="application/json")
         return self._generate_content_cascade("FLASH", prompt, force_json=True, **kwargs)
 
     async def generate_content_synthesizer_async(self, model_name, prompt, **kwargs):
@@ -771,8 +818,12 @@ class ResearchTools:
         model = os.environ.get("TARGET_MODEL", getattr(self.config, 'TARGET_MODEL', ''))
         is_local = getattr(self.config, 'LLM_BACKEND', '') in ["LOCAL_PRO", "LOCAL_CLASSROOM"]
         use_vllm = getattr(self.config, 'USE_vLLM', False) or os.environ.get("DEEPCOLLECTOR_USE_VLLM", "False") == "True"
-        max_t = kwargs.pop("max_new_tokens", 512)
+        
+        # 🔥 V296: Intercept upstream max_tokens args so the asyncio LLMs aren't decapitated.
         force_json = kwargs.pop("force_json", True)
+        passed_t = int(kwargs.pop("max_new_tokens", 512))
+        max_t = max(passed_t, 1024) if force_json else passed_t
+        
         for bad_k in ["do_sample", "temperature", "top_p", "top_k", "repetition_penalty", "return_dict_in_generate", "output_scores", "stop", "config", "force_json"]: kwargs.pop(bad_k, None)
 
         sys_msg = (
@@ -793,19 +844,21 @@ class ResearchTools:
             model_id = os.environ.get("LOCAL_MODEL_ID", "google/gemma-4-31b-it")
             dc_temp = float(os.environ.get("DC_TEMP", "0.0"))
 
-            if any(x in model_id.lower() for x in ["gemma-2", "deepseek"]): messages = [{"role": "user", "content": sys_msg + "\n\n" + prompt}]
-            else: messages = [{"role": "system", "content": sys_msg}, {"role": "user", "content": prompt}]
-
             for attempt in range(3):
                 try:
+                    if any(x in model_id.lower() for x in ["gemma-2", "deepseek"]): messages = [{"role": "user", "content": sys_msg + "\n\n" + prompt}]
+                    else: messages = [{"role": "system", "content": sys_msg}, {"role": "user", "content": prompt}]
+                    
                     payload = {"model": model_id, "messages": messages, "max_tokens": max_t, "temperature": dc_temp}
                     if force_json and not any(x in model_id.lower() for x in ["deepseek", "command-r"]): payload["response_format"] = {"type": "json_object"}
+                    
                     try: resp = await asyncio.wait_for(client.chat.completions.create(**payload), timeout=120.0)
                     except Exception as api_err:
                         if "format" in str(api_err).lower() or "json" in str(api_err).lower() or "400" in str(api_err).lower():
                             payload.pop("response_format", None)
                             resp = await asyncio.wait_for(client.chat.completions.create(**payload), timeout=120.0)
                         else: raise api_err
+                        
                     self._record_timing(f"vLLM ({model_id})", time.time() - api_start, f"vLLM ({model_id})")
                     raw_res = resp.choices[0].message.content
                     if force_json: return MockResp(self._shielded_json_wrap(raw_res, prompt))
@@ -816,13 +869,8 @@ class ResearchTools:
                         inst_idx = prompt.rfind("Instructions:")
                         if inst_idx == -1: inst_idx = prompt.rfind("Format EXACTLY")
                         if inst_idx != -1:
-                            instructions = prompt[inst_idx:]
-                            body = prompt[:inst_idx]
-                            chop_len = int(len(body) * 0.80)
-                            prompt = body[:chop_len] + "\n\n...[TRUNCATED]...\n\n" + instructions
+                            prompt = prompt[:int(len(prompt[:inst_idx]) * 0.80)] + "\n\n...[TRUNCATED]...\n\n" + prompt[inst_idx:]
                         else: prompt = prompt[:int(len(prompt)*0.85)] + "\n\n...[TRUNCATED]..."
-                        if any(x in model_id.lower() for x in ["gemma-2", "deepseek"]): messages[0]["content"] = sys_msg + "\n\n" + prompt
-                        else: messages[1]["content"] = prompt
                         continue
                     if attempt == 2: return MockResp(self._shielded_json_wrap("[missing]", prompt)) if force_json else MockResp("[missing]")
                     await asyncio.sleep(2)
@@ -862,11 +910,10 @@ class ResearchTools:
             cfg = types.GenerateContentConfig(max_output_tokens=max_t, temperature=0.0, system_instruction=sys_msg)
             if force_json:
                 cfg.response_mime_type = "application/json"
-                cfg.response_schema = CellExtractionSchema
             kwargs["config"] = cfg
 
         loop = asyncio.get_running_loop()
         safe_prompt = f"{sys_msg}\n\n{prompt}"
         return await loop.run_in_executor(self.thread_pool, functools.partial(self._generate_content_cascade, "FLASH", safe_prompt, force_json=force_json, **kwargs))
 
-print("✅ deepcollector/tools/research.py LOADED (V293: Zero-Fail JSON Shield Active)")
+print("✅ deepcollector/tools/research.py LOADED (V296: Token Starvation Overrides Active)")
