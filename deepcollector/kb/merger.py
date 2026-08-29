@@ -1,5 +1,6 @@
+# filepath: deepcollector/kb/merger.py
 # =============================================================================
-# V58.17: Project Merger (PRO-Oracle Upgrade & JSON Artifact Scrubbing)
+# V58.18: Project Merger (PRO-Oracle Upgrade & Robust JSON Extraction)
 # =============================================================================
 import pandas as pd
 import difflib
@@ -55,23 +56,23 @@ class UniversalOracle:
             for current_idx, model_name in enumerate(all_models):
                 if time.time() < self.model_cooldowns.get(model_name, 0): continue
                 api_start = time.time()
-                
+
                 req_kwargs = {"model": model_name, "contents": prompt}
-                
+
                 if types:
                     c_obj = types.GenerateContentConfig()
                     if base_config:
                         for attr in ['temperature', 'top_p', 'top_k', 'candidate_count', 'max_output_tokens', 'stop_sequences', 'response_mime_type', 'response_schema', 'system_instruction', 'tools']:
                             if hasattr(base_config, attr) and getattr(base_config, attr) is not None:
                                 setattr(c_obj, attr, getattr(base_config, attr))
-                                
+
                     if self.enable_search:
                         c_obj.tools = [types.Tool(google_search=types.GoogleSearch())]
-                        
+
                     # INJECT THINKING CONFIG EXCLUSIVELY FOR 3.1-PRO
                     if "3.1-pro" in model_name or "3-pro" in model_name:
                         c_obj.thinking_config = types.ThinkingConfig(thinking_budget=4096)
-                        
+
                     req_kwargs["config"] = c_obj
 
                 try:
@@ -90,11 +91,11 @@ class UniversalOracle:
                     self.model_stats[model_name]["count"] += 1
 
                     err_str = str(e).lower()
-                    
+
                     if "404" in err_str or "not found" in err_str:
                         self.stats['errors'] += 1
                         if self.verbosity >= 1: print(f"        ⚠️ Model {model_name} Not Found (404). Cascading...")
-                        self.model_cooldowns[model_name] = time.time() + 86400 
+                        self.model_cooldowns[model_name] = time.time() + 86400
                         if current_idx < len(all_models) - 1: continue
                     elif "429" in err_str or "exhausted" in err_str or "quota" in err_str or "503" in err_str:
                         self.stats['rate_limits_hit'] += 1
@@ -114,6 +115,56 @@ class UniversalOracle:
 
         if self.verbosity >= 1: print("\n🛑 CRITICAL ABORT: Failed across all available models after multiple attempts.")
         raise RuntimeError("LLM Cascade failed: All models exhausted or on cooldown.")
+
+    def _parse_oracle_json(self, text: str) -> dict:
+        """Centralized resilient JSON parser to handle all LLM hallucinations."""
+        if not text: return {}
+        # Clean thinking tags
+        clean_text = re.sub(r'<think>.*?</think>', '', str(text), flags=re.DOTALL | re.IGNORECASE).strip()
+        
+        # Targeted Markdown Extraction
+        md_match = re.search(r'```(?:json)?\s*(.*?)\s*```', clean_text, flags=re.DOTALL | re.IGNORECASE)
+        json_str = md_match.group(1).strip() if md_match else clean_text
+        
+        # Fix trailing commas inside arrays/objects
+        json_str = re.sub(r',\s*([\]}])', r'\1', json_str)
+        
+        result = {}
+        try:
+            result = json.loads(json_str, strict=False)
+        except Exception:
+            # Greedy Bounding Box Extraction
+            start_obj = json_str.find('{')
+            end_obj = json_str.rfind('}')
+            start_arr = json_str.find('[')
+            end_arr = json_str.rfind(']')
+            
+            is_dict = start_obj != -1 and end_obj != -1 and start_obj < end_obj
+            is_list = start_arr != -1 and end_arr != -1 and start_arr < end_arr
+            target = json_str
+            
+            if is_dict and is_list:
+                if start_obj < start_arr and end_obj > end_arr: target = json_str[start_obj:end_obj+1]
+                elif start_arr < start_obj and end_arr > end_obj: target = json_str[start_arr:end_arr+1]
+                else: target = json_str[start_obj:end_obj+1]
+            elif is_dict: target = json_str[start_obj:end_obj+1]
+            elif is_list: target = json_str[start_arr:end_arr+1]
+            
+            try: result = json.loads(target, strict=False)
+            except Exception: pass
+            
+        # Auto-Unwrapping Phase
+        if isinstance(result, list) and len(result) > 0 and isinstance(result[0], dict):
+            result = result[0]
+        elif isinstance(result, list):
+            result = {}
+            
+        if isinstance(result, dict) and len(result) == 1:
+            first_key = list(result.keys())[0]
+            if isinstance(result[first_key], dict) and ("Schema" in first_key or "Oracle" in first_key):
+                result = result[first_key]
+                
+        return result if isinstance(result, dict) else {}
 
     def _are_names_distinct_variants(self, n1, n2):
         n1 = str(n1).lower().strip(); n2 = str(n2).lower().strip()
@@ -161,7 +212,7 @@ class UniversalOracle:
             if not url: return ""
             u_str = str(url).strip().lower()
             if u_str in self.MISSING: return ""
-            # NEW: Strip nasty JSON list artifacts left by Gemini Flash (e.g., '["url"]')
+            # Strip nasty JSON list artifacts left by Gemini Flash (e.g., '["url"]')
             u_str = re.sub(r'^[\[\'\"]+|[\]\'\"]+$', '', u_str)
             if '?' in u_str: u_str = u_str.split('?')[0]
             if hasattr(u_str, 'rstrip'): return u_str.rstrip('/')
@@ -253,22 +304,13 @@ class UniversalOracle:
             self.stats['llm_calls'] += 1
             kwargs = {}
             if types: kwargs["config"] = types.GenerateContentConfig(response_mime_type="application/json", response_schema=OracleResponseSchema)
-            
-            # 🔥 NEW: Force the Oracle to use PRO models instead of FLASH for higher accuracy
+
+            # Force the Oracle to use PRO models instead of FLASH for higher accuracy
             response_text = self._call_llm_with_cascade(prompt, pool_preference="PRO", **kwargs)
 
-            try:
-                result = json.loads(response_text)
-                is_match = result.get('is_same', False)
-            except json.JSONDecodeError:
-                match = re.search(r"\{.*?\}", response_text.strip(), re.DOTALL)
-                if match:
-                    try:
-                        result = json.loads(match.group())
-                        is_match = result.get('is_same', False)
-                    except json.JSONDecodeError:
-                        is_match = False
-                else: is_match = False
+            # Centralized robust parse logic
+            result = self._parse_oracle_json(response_text)
+            is_match = result.get('is_same', False)
 
             self.llm_cache[cache_key] = is_match
             if is_match:
@@ -324,7 +366,7 @@ class ProjectMerger:
         mode_str = "🚫 DRY RUN" if dry_run else "💾 LIVE"
         scope_str = "🌍 GLOBAL SCAN" if is_global else f"🎯 PROJECT: {project_id}"
         search_str = "🔍 Web Grounding ON" if self.oracle.enable_search else "📖 Closed Book"
-        print(f"\n🤝 STARTING MERGE: {scope_str} [{mode_str}] | {search_str} (V58.17)")
+        print(f"\n🤝 STARTING MERGE: {scope_str} [{mode_str}] | {search_str} (V58.18)")
 
         if not enable_singleton_verification:
             if is_global: print("    🌍 GLOBAL MODE: Bypassing Singleton Project-Relevance Checks (Deduplication Only).")
@@ -531,22 +573,17 @@ class ProjectMerger:
             self.oracle.stats['llm_calls'] += 1
             kwargs = {}
             if types: kwargs["config"] = types.GenerateContentConfig(response_mime_type="application/json", response_schema=SingletonVerificationSchema)
+            
             response_text = self.oracle._call_llm_with_cascade(prompt, pool_preference="PRO" if project_source_text else "PRO", **kwargs)
-            try:
-                res = json.loads(response_text)
-                return "Yes" if res.get("in_project") else "No", "Yes" if res.get("exists") else "No", res.get("rationale", "")[:80]
-            except json.JSONDecodeError:
-                match = re.search(r"\{.*?\}", response_text.strip(), re.DOTALL)
-                if match:
-                    try:
-                        res = json.loads(match.group())
-                        return "Yes" if res.get("in_project") else "No", "Yes" if res.get("exists") else "No", res.get("rationale", "")[:80]
-                    except json.JSONDecodeError:
-                        pass
+            res = self.oracle._parse_oracle_json(response_text)
+            
+            if not res:
+                return "Unknown", "Unknown", "Failed to parse JSON"
+            return "Yes" if res.get("in_project") else "No", "Yes" if res.get("exists") else "No", str(res.get("rationale", ""))[:80]
+            
         except Exception as e:
             self.oracle.stats['errors'] += 1
             return "Error", "Error", str(e)[:40]
-        return "Unknown", "Unknown", "Failed to parse JSON"
 
     def _evaluate_and_print_singletons(self, singletons, project_id, project_context, is_global, run_llm=False, project_source_text=""):
         print(f"\n    🟡 UNMERGED DATASETS ({len(singletons)} Singletons)")

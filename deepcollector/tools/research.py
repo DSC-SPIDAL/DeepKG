@@ -1,5 +1,6 @@
+# filepath: deepcollector/tools/research.py
 # =============================================================================
-# V288: Research Tools (Omni-Regex JSON Rescue & Qwen JSON Unlock)
+# V289: Research Tools (Omni-Regex JSON Rescue & Safe Type Extraction)
 # =============================================================================
 import os
 import requests
@@ -198,6 +199,14 @@ class ResearchTools:
             model = self.models.MODEL_PLANNER
             response = self.generate_content_planner(model, prompt)
             urls = self._extract_json_robustly(response.text)
+            
+            # Universal Type Normalizer: extract lists accidentally wrapped in dictionaries
+            if isinstance(urls, dict):
+                for v in urls.values():
+                    if isinstance(v, list):
+                        urls = v
+                        break
+
             if isinstance(urls, list):
                 urls = [u for u in urls if isinstance(u, str) and u.startswith('http')]
                 return urls[:max_links]
@@ -254,7 +263,7 @@ class ResearchTools:
                 text_content = response.text if response.text else ""
                 md_links = re.findall(r'\[(.*?)\]\((https?://[^\)]+)\)', text_content)
                 for title, url in md_links: results.append({"url": url.strip(), "title": title.strip(), "content": "Extracted via Markdown", "type": "Gemini Grounding"})
-                
+
                 raw_urls = re.findall(r'(https?://[^\s>\x22\x27\)]+)', text_content)
                 for url in raw_urls:
                     clean_url = url.rstrip('.,;:')
@@ -293,100 +302,61 @@ class ResearchTools:
 
     def _extract_json_robustly(self, text: str) -> Any:
         if not text or text == "[missing]": return []
-        
+
         clean_text = str(text).strip()
-        
+
         # Remove <think> tags completely
         clean_text = re.sub(r'<think>.*?</think>', '', clean_text, flags=re.DOTALL | re.IGNORECASE).strip()
-        
-        # Remove ALL markdown formatting anywhere in the text unconditionally
-        clean_text = re.sub(r'```(?:json)?\s*', '', clean_text, flags=re.IGNORECASE)
-        clean_text = re.sub(r'\s*```$', '', clean_text, flags=re.IGNORECASE)
-        clean_text = clean_text.strip()
-        
-        # 1. Standard Native Clean Parse (Strict=False allows unescaped structural newlines)
-        try: return json.loads(clean_text, strict=False)
-        except Exception: pass
-        
-        # 2. Extract specific JSON object or array to filter out any preceding conversational text
+
+        # Extract markdown payload gracefully (replaces destructive global sub)
+        md_match = re.search(r'```(?:json)?\s*(.*?)\s*```', clean_text, flags=re.DOTALL | re.IGNORECASE)
+        if md_match:
+            clean_text = md_match.group(1).strip()
+
+        # Isolate bounding box (Dict or List)
         start_obj = clean_text.find('{')
         end_obj = clean_text.rfind('}')
         start_arr = clean_text.find('[')
         end_arr = clean_text.rfind(']')
-        
+
         json_str = ""
         is_dict = start_obj != -1 and end_obj != -1
         is_list = start_arr != -1 and end_arr != -1
-        
+
         if is_dict and is_list:
             if start_obj < start_arr and end_obj > end_arr:
                 json_str = clean_text[start_obj:end_obj+1]
             elif start_arr < start_obj and end_arr > end_obj:
                 json_str = clean_text[start_arr:end_arr+1]
             else:
-                json_str = clean_text[start_obj:end_obj+1] # fallback to dict
+                json_str = clean_text[start_obj:end_obj+1]
         elif is_dict:
             json_str = clean_text[start_obj:end_obj+1]
         elif is_list:
             json_str = clean_text[start_arr:end_arr+1]
         else:
             json_str = clean_text
-            
+
+        # Strip structural trailing commas naturally
+        json_str = re.sub(r',\s*([\]}])', r'\1', json_str)
+
         try:
-            # Re-attempt load on snipped block
             return json.loads(json_str, strict=False)
         except Exception: pass
-            
-        # 3. Python literal eval for booleans/nulls directly in safe parser
+
+        # Safe python literal eval using word boundaries (preventing "the true story" -> "the True story")
         try:
-            py_str = json_str.replace('true', 'True').replace('false', 'False').replace('null', 'None')
+            py_str = re.sub(r'\btrue\b', 'True', json_str, flags=re.IGNORECASE)
+            py_str = re.sub(r'\bfalse\b', 'False', py_str, flags=re.IGNORECASE)
+            py_str = re.sub(r'\bnull\b', 'None', py_str, flags=re.IGNORECASE)
             return ast.literal_eval(py_str)
         except Exception: pass
-            
-        # 4. Fallback Regex Manual Extraction (Highly Resilient against missing formatting)
-        result = {}
-        def extract_field(key_name, stop_keys):
-            key_match = re.search(rf'[-*]?\s*[\x22\x27]?{key_name}[\x22\x27]?\s*:\s*', json_str, re.IGNORECASE)
-            if not key_match: return None
-            
-            start_pos = key_match.end()
-            end_pos = len(json_str)
-            
-            for sk in stop_keys:
-                sk_match = re.search(rf'[,]?\s*[-*]?\s*[\x22\x27]?{sk}[\x22\x27]?\s*:', json_str[start_pos:], re.IGNORECASE)
-                if sk_match:
-                    match_pos = start_pos + sk_match.start()
-                    if match_pos < end_pos: end_pos = match_pos
-            
-            if end_pos == len(json_str):
-                last_brace = json_str.rfind('}', start_pos)
-                if last_brace != -1: end_pos = last_brace
-                    
-            val = json_str[start_pos:end_pos].strip()
-            if val.endswith(','): val = val[:-1].strip()
-            if val.startswith('\x22') and val.endswith('\x22'): val = val[1:-1]
-            elif val.startswith('\x27') and val.endswith('\x27'): val = val[1:-1]
-            
-            # Safely transform string boundaries WITHOUT corrupting outer structures
-            return val.replace('\\n', '\n').replace('\\"', '"')
 
-        v = extract_field("value", ["confidence", "rationale"])
-        c = extract_field("confidence", ["value", "rationale"])
-        r = extract_field("rationale", ["value", "confidence"])
-        
-        if v is not None: result['value'] = v
-        if c is not None:
-            try: result['confidence'] = float(re.search(r'[\d\.]+', str(c)).group())
-            except Exception: result['confidence'] = 0.95
-        if r is not None: result['rationale'] = r
-        
-        if result: return result
-        
-        # 5. Negative Match Inference (if conversational refusal entirely blocks JSON)
+        # Negative Match Inference (if conversational refusal entirely blocks JSON)
         lower_text = clean_text.lower()
         if "not mention" in lower_text or "not specif" in lower_text or "not found" in lower_text or "does not contain" in lower_text:
             return {"value": "[missing]", "confidence": 0.0, "rationale": "Inferred from conversational refusal"}
-            
+
         return []
 
     def tool_load_url(self, url: str) -> List[Dict[str, str]]:
@@ -402,7 +372,7 @@ class ResearchTools:
                     client = arxiv.Client()
                     search = arxiv.Search(id_list=[paper_id])
                     paper = next(client.results(search))
-                    
+
                     target_url = paper.pdf_url.replace("http://", "https://")
 
                     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
@@ -435,14 +405,14 @@ class ResearchTools:
 
     def _generate_content_local(self, prompt: str, **kwargs):
         is_vllm = getattr(self.config, 'USE_vLLM', False) or os.environ.get("DEEPCOLLECTOR_USE_VLLM", "False") == "True"
-        
+
         sys_msg = (
             "You are a strict data extraction AI. You MUST output ONLY a raw JSON dictionary.\n"
             "If the information is missing from the text, you MUST output EXACTLY: "
             "{\"value\": \"[missing]\", \"confidence\": 0.0, \"rationale\": \"Not found in context.\"}\n"
             "NEVER write conversational sentences. NEVER apologize. ONLY return the JSON block."
         )
-        
+
         if is_vllm:
             import openai
             api_start = time.time()
@@ -459,17 +429,17 @@ class ResearchTools:
 
             for attempt in range(3):
                 try:
-                    if any(x in model_id.lower() for x in ["gemma-2", "deepseek", "qwen", "llama", "command-r"]): 
+                    if any(x in model_id.lower() for x in ["gemma-2", "deepseek", "qwen", "llama", "command-r"]):
                         messages = [{"role": "user", "content": sys_msg + "\n\n" + current_prompt}]
-                    else: 
+                    else:
                         messages = [{"role": "system", "content": sys_msg}, {"role": "user", "content": current_prompt}]
-                    
+
                     payload = {"model": model_id, "messages": messages, "max_tokens": max_new_tokens, "temperature": dc_temp}
-                    
-                    # 🎯 CRITICAL FIX: Qwen is removed from the blacklist so it correctly utilizes vLLM json_object decoding
+
+                    # CRITICAL FIX: Qwen is removed from the blacklist so it correctly utilizes vLLM json_object decoding
                     if force_json and not any(x in model_id.lower() for x in ["deepseek", "command-r"]):
                         payload["response_format"] = {"type": "json_object"}
-                        
+
                     try: response = client.chat.completions.create(**payload)
                     except Exception as api_err:
                         if "format" in str(api_err).lower() or "json" in str(api_err).lower() or "400" in str(api_err).lower():
@@ -495,7 +465,7 @@ class ResearchTools:
                         else:
                             chop_len = int(len(current_prompt) * 0.85)
                             current_prompt = current_prompt[:chop_len] + "\n\n...[TRUNCATED TO FIT VRAM]..."
-                        continue 
+                        continue
                     if attempt == 2:
                         if os.environ.get("ABORT_ON_VLLM_FAILURE", "True") == "True": os._exit(1)
                         else: return self._generate_content_cascade("PRO" if "strategic planner" in prompt else "FLASH", prompt, **kwargs)
@@ -594,11 +564,11 @@ class ResearchTools:
                 if self.verbosity >= 1: print(f"    ⚠️ [Cascade] '{target_model_str}' failed: {type(e).__name__} - {str(e)[:150]}")
                 if ("404" in error_str or "not found" in error_str or "429" in error_str or "quota" in error_str or "503" in error_str or "timeout" in error_str or duration > self.SLOW_THRESHOLD_SEC):
                     time.sleep(1.0)
-                    if current_idx < len(pool) - 1: 
+                    if current_idx < len(pool) - 1:
                         if self.verbosity >= 1: print(f"    ➡️ Cascading seamlessly to next model: {pool[current_idx+1]}")
                         continue
                     else: raise ResourceWarning(f"All models in {pool_name} pool exhausted. Last Error: {e}")
-                else: 
+                else:
                     if current_idx < len(pool) - 1:
                         if self.verbosity >= 1: print(f"    ➡️ Unrecognized error. Safety cascade to next model: {pool[current_idx+1]}")
                         continue
@@ -639,9 +609,9 @@ class ResearchTools:
         is_local = getattr(self.config, 'LLM_BACKEND', '') in ["LOCAL_PRO", "LOCAL_CLASSROOM"]
         use_vllm = getattr(self.config, 'USE_vLLM', False) or os.environ.get("DEEPCOLLECTOR_USE_VLLM", "False") == "True"
         max_t = kwargs.pop("max_new_tokens", 512)
-        force_json = kwargs.pop("force_json", True) 
+        force_json = kwargs.pop("force_json", True)
         for bad_k in ["do_sample", "temperature", "top_p", "top_k", "repetition_penalty", "return_dict_in_generate", "output_scores", "stop", "config", "force_json"]: kwargs.pop(bad_k, None)
-        
+
         sys_msg = (
             "You are a strict data extraction AI. You MUST output ONLY a valid JSON dictionary.\n"
             "Do NOT wrap the JSON in Markdown (no ```json ... ```).\n"
@@ -659,10 +629,10 @@ class ResearchTools:
             client = openai.AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY", "sk-vllm-dummy-key"), base_url=os.environ.get("OPENAI_API_BASE", "http://localhost:8000/v1"), max_retries=0, timeout=1200.0)
             model_id = os.environ.get("LOCAL_MODEL_ID", "google/gemma-4-31b-it")
             dc_temp = float(os.environ.get("DC_TEMP", "0.0"))
-            
+
             if any(x in model_id.lower() for x in ["gemma-2", "deepseek"]): messages = [{"role": "user", "content": sys_msg + "\n\n" + prompt}]
             else: messages = [{"role": "system", "content": sys_msg}, {"role": "user", "content": prompt}]
-            
+
             for attempt in range(3):
                 try:
                     payload = {"model": model_id, "messages": messages, "max_tokens": max_t, "temperature": dc_temp}
@@ -731,4 +701,4 @@ class ResearchTools:
         safe_prompt = f"{sys_msg}\n\n{prompt}"
         return await loop.run_in_executor(self.thread_pool, functools.partial(self._generate_content_cascade, "FLASH", safe_prompt, force_json=force_json, **kwargs))
 
-print("✅ deepcollector/tools/research.py LOADED (V288: JSON Parser Fix & Prompt Hardening)")
+print("✅ deepcollector/tools/research.py LOADED (V289: Safe Markdown Extraction & Structure Normalization)")
