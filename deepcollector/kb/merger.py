@@ -1,6 +1,5 @@
-# filepath: deepcollector/kb/merger.py
 # =============================================================================
-# V58.18: Project Merger (PRO-Oracle Upgrade & Robust JSON Extraction)
+# V58.19: Project Merger (Regex Rescue Safety Net & Error Logging)
 # =============================================================================
 import pandas as pd
 import difflib
@@ -69,7 +68,6 @@ class UniversalOracle:
                     if self.enable_search:
                         c_obj.tools = [types.Tool(google_search=types.GoogleSearch())]
 
-                    # INJECT THINKING CONFIG EXCLUSIVELY FOR 3.1-PRO
                     if "3.1-pro" in model_name or "3-pro" in model_name:
                         c_obj.thinking_config = types.ThinkingConfig(thinking_budget=4096)
 
@@ -119,6 +117,8 @@ class UniversalOracle:
     def _parse_oracle_json(self, text: str) -> dict:
         """Centralized resilient JSON parser to handle all LLM hallucinations."""
         if not text: return {}
+        original_raw_text = str(text)
+        
         # Clean thinking tags
         clean_text = re.sub(r'<think>.*?</think>', '', str(text), flags=re.DOTALL | re.IGNORECASE).strip()
         
@@ -139,8 +139,8 @@ class UniversalOracle:
             start_arr = json_str.find('[')
             end_arr = json_str.rfind(']')
             
-            is_dict = start_obj != -1 and end_obj != -1 and start_obj < end_obj
-            is_list = start_arr != -1 and end_arr != -1 and start_arr < end_arr
+            is_dict = start_obj != -1 and end_obj != -1 and start_obj <= end_obj
+            is_list = start_arr != -1 and end_arr != -1 and start_arr <= end_arr
             target = json_str
             
             if is_dict and is_list:
@@ -150,8 +150,30 @@ class UniversalOracle:
             elif is_dict: target = json_str[start_obj:end_obj+1]
             elif is_list: target = json_str[start_arr:end_arr+1]
             
-            try: result = json.loads(target, strict=False)
-            except Exception: pass
+            try: 
+                result = json.loads(target, strict=False)
+            except Exception: 
+                # =====================================================================
+                # V58.19: REGEX SAFETY NET FOR ORACLE
+                # =====================================================================
+                target_lower = target.lower()
+                if "is_same" in target_lower:
+                    is_same_match = re.search(r'["\']?is_same["\']?\s*:\s*(true|false)', target, re.IGNORECASE)
+                    if is_same_match:
+                        result = {"is_same": is_same_match.group(1).lower() == 'true'}
+                        rat_match = re.search(r'["\']?rationale["\']?\s*:\s*["\'](.*?)["\']\s*(?:}|$)', target, re.IGNORECASE)
+                        if rat_match: result["rationale"] = rat_match.group(1)
+                        
+                elif "in_project" in target_lower and "exists" in target_lower:
+                    in_proj_match = re.search(r'["\']?in_project["\']?\s*:\s*(true|false)', target, re.IGNORECASE)
+                    exists_match = re.search(r'["\']?exists["\']?\s*:\s*(true|false)', target, re.IGNORECASE)
+                    if in_proj_match and exists_match:
+                        result = {
+                            "in_project": in_proj_match.group(1).lower() == 'true',
+                            "exists": exists_match.group(1).lower() == 'true'
+                        }
+                        rat_match = re.search(r'["\']?rationale["\']?\s*:\s*["\'](.*?)["\']\s*(?:}|$)', target, re.IGNORECASE)
+                        if rat_match: result["rationale"] = rat_match.group(1)
             
         # Auto-Unwrapping Phase
         if isinstance(result, list) and len(result) > 0 and isinstance(result[0], dict):
@@ -163,8 +185,22 @@ class UniversalOracle:
             first_key = list(result.keys())[0]
             if isinstance(result[first_key], dict) and ("Schema" in first_key or "Oracle" in first_key):
                 result = result[first_key]
-                
-        return result if isinstance(result, dict) else {}
+
+        if result:
+            return result
+
+        # =========================================================================
+        # 🚨 ERROR LOGGER: Writes unparsable LLM payloads to a file 🚨
+        # =========================================================================
+        try:
+            with open("json_fatal_errors.log", "a", encoding="utf-8") as f:
+                f.write("\n" + "="*80 + "\n")
+                f.write(f"FAILED TO PARSE ORACLE JSON:\n")
+                f.write(f"RAW TEXT:\n{original_raw_text}\n")
+                f.write("="*80 + "\n")
+        except Exception: pass
+
+        return {}
 
     def _are_names_distinct_variants(self, n1, n2):
         n1 = str(n1).lower().strip(); n2 = str(n2).lower().strip()
@@ -212,7 +248,6 @@ class UniversalOracle:
             if not url: return ""
             u_str = str(url).strip().lower()
             if u_str in self.MISSING: return ""
-            # Strip nasty JSON list artifacts left by Gemini Flash (e.g., '["url"]')
             u_str = re.sub(r'^[\[\'\"]+|[\]\'\"]+$', '', u_str)
             if '?' in u_str: u_str = u_str.split('?')[0]
             if hasattr(u_str, 'rstrip'): return u_str.rstrip('/')
@@ -305,10 +340,8 @@ class UniversalOracle:
             kwargs = {}
             if types: kwargs["config"] = types.GenerateContentConfig(response_mime_type="application/json", response_schema=OracleResponseSchema)
 
-            # Force the Oracle to use PRO models instead of FLASH for higher accuracy
             response_text = self._call_llm_with_cascade(prompt, pool_preference="PRO", **kwargs)
 
-            # Centralized robust parse logic
             result = self._parse_oracle_json(response_text)
             is_match = result.get('is_same', False)
 
@@ -366,7 +399,7 @@ class ProjectMerger:
         mode_str = "🚫 DRY RUN" if dry_run else "💾 LIVE"
         scope_str = "🌍 GLOBAL SCAN" if is_global else f"🎯 PROJECT: {project_id}"
         search_str = "🔍 Web Grounding ON" if self.oracle.enable_search else "📖 Closed Book"
-        print(f"\n🤝 STARTING MERGE: {scope_str} [{mode_str}] | {search_str} (V58.18)")
+        print(f"\n🤝 STARTING MERGE: {scope_str} [{mode_str}] | {search_str} (V58.19)")
 
         if not enable_singleton_verification:
             if is_global: print("    🌍 GLOBAL MODE: Bypassing Singleton Project-Relevance Checks (Deduplication Only).")

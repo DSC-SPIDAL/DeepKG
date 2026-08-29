@@ -1,6 +1,5 @@
-# filepath: deepcollector/tools/research.py
 # =============================================================================
-# V289: Research Tools (Omni-Regex JSON Rescue & Safe Type Extraction)
+# V290: Research Tools (Restored Regex Safety Net & Error Logging)
 # =============================================================================
 import os
 import requests
@@ -302,13 +301,13 @@ class ResearchTools:
 
     def _extract_json_robustly(self, text: str) -> Any:
         if not text or text == "[missing]": return []
-
         clean_text = str(text).strip()
+        original_raw_text = clean_text
 
         # Remove <think> tags completely
         clean_text = re.sub(r'<think>.*?</think>', '', clean_text, flags=re.DOTALL | re.IGNORECASE).strip()
 
-        # Extract markdown payload gracefully (replaces destructive global sub)
+        # Extract markdown payload gracefully
         md_match = re.search(r'```(?:json)?\s*(.*?)\s*```', clean_text, flags=re.DOTALL | re.IGNORECASE)
         if md_match:
             clean_text = md_match.group(1).strip()
@@ -320,8 +319,8 @@ class ResearchTools:
         end_arr = clean_text.rfind(']')
 
         json_str = ""
-        is_dict = start_obj != -1 and end_obj != -1
-        is_list = start_arr != -1 and end_arr != -1
+        is_dict = start_obj != -1 and end_obj != -1 and start_obj <= end_obj
+        is_list = start_arr != -1 and end_arr != -1 and start_arr <= end_arr
 
         if is_dict and is_list:
             if start_obj < start_arr and end_obj > end_arr:
@@ -341,21 +340,97 @@ class ResearchTools:
         json_str = re.sub(r',\s*([\]}])', r'\1', json_str)
 
         try:
-            return json.loads(json_str, strict=False)
+            result = json.loads(json_str, strict=False)
+            
+            # Auto-Unwrapping Phase (Defeats Nested Schema Hallucinations)
+            if isinstance(result, list) and len(result) == 1 and isinstance(result[0], dict): result = result[0]
+            if isinstance(result, dict) and len(result) == 1:
+                first_key = list(result.keys())[0]
+                if isinstance(result[first_key], dict) and ("Schema" in first_key or "Oracle" in first_key or "result" in first_key.lower()):
+                    result = result[first_key]
+                    
+            return result
         except Exception: pass
 
-        # Safe python literal eval using word boundaries (preventing "the true story" -> "the True story")
+        # Safe python literal eval using word boundaries
         try:
             py_str = re.sub(r'\btrue\b', 'True', json_str, flags=re.IGNORECASE)
             py_str = re.sub(r'\bfalse\b', 'False', py_str, flags=re.IGNORECASE)
             py_str = re.sub(r'\bnull\b', 'None', py_str, flags=re.IGNORECASE)
-            return ast.literal_eval(py_str)
+            result = ast.literal_eval(py_str)
+            
+            if isinstance(result, list) and len(result) == 1 and isinstance(result[0], dict): result = result[0]
+            if isinstance(result, dict) and len(result) == 1:
+                first_key = list(result.keys())[0]
+                if isinstance(result[first_key], dict) and ("Schema" in first_key or "Oracle" in first_key):
+                    result = result[first_key]
+            return result
         except Exception: pass
 
-        # Negative Match Inference (if conversational refusal entirely blocks JSON)
+        # =========================================================================
+        # RESTORED V290: REGEX FALLBACK MANUAL EXTRACTION (SCHEMA-AWARE)
+        # =========================================================================
+        result = {}
+        def extract_field(key_name, stop_keys):
+            key_match = re.search(rf'[-*]?\s*[\x22\x27]?{key_name}[\x22\x27]?\s*:\s*', json_str, re.IGNORECASE)
+            if not key_match: return None
+
+            start_pos = key_match.end()
+            end_pos = len(json_str)
+
+            for sk in stop_keys:
+                sk_match = re.search(rf'[,]?\s*[-*]?\s*[\x22\x27]?{sk}[\x22\x27]?\s*:', json_str[start_pos:], re.IGNORECASE)
+                if sk_match:
+                    match_pos = start_pos + sk_match.start()
+                    if match_pos < end_pos: end_pos = match_pos
+
+            if end_pos == len(json_str):
+                last_brace = json_str.rfind('}', start_pos)
+                if last_brace != -1: end_pos = last_brace
+
+            val = json_str[start_pos:end_pos].strip()
+            if val.endswith(','): val = val[:-1].strip()
+            if val.startswith('\x22') and val.endswith('\x22'): val = val[1:-1]
+            elif val.startswith('\x27') and val.endswith('\x27'): val = val[1:-1]
+
+            return val.replace('\\n', '\n').replace('\\"', '"')
+
         lower_text = clean_text.lower()
+        
+        # 1. Check for CellExtractionSchema (RAG)
+        if "value" in lower_text or "rationale" in lower_text:
+            v = extract_field("value", ["confidence", "rationale"])
+            c = extract_field("confidence", ["value", "rationale"])
+            r = extract_field("rationale", ["value", "confidence"])
+
+            if v is not None: result['value'] = v
+            if c is not None:
+                try: result['confidence'] = float(re.search(r'[\d\.]+', str(c)).group())
+                except Exception: result['confidence'] = 0.95
+            if r is not None: result['rationale'] = r
+            if result: return result
+            
+        # 2. Check for Search Queries Schema (Planner)
+        if "queries" in lower_text:
+            arr_match = re.search(r'\[(.*?)\]', json_str, re.DOTALL)
+            if arr_match:
+                items = re.findall(r'[\x22\x27](.*?)[\x22\x27]', arr_match.group(1))
+                if items: return {"queries": items}
+
+        # Negative Match Inference
         if "not mention" in lower_text or "not specif" in lower_text or "not found" in lower_text or "does not contain" in lower_text:
             return {"value": "[missing]", "confidence": 0.0, "rationale": "Inferred from conversational refusal"}
+
+        # =========================================================================
+        # 🚨 ERROR LOGGER: Writes unparsable LLM payloads to a file 🚨
+        # =========================================================================
+        try:
+            with open("json_fatal_errors.log", "a", encoding="utf-8") as f:
+                f.write("\n" + "="*80 + "\n")
+                f.write(f"FAILED TO PARSE JSON:\n")
+                f.write(f"RAW TEXT:\n{original_raw_text}\n")
+                f.write("="*80 + "\n")
+        except Exception: pass
 
         return []
 
@@ -436,7 +511,6 @@ class ResearchTools:
 
                     payload = {"model": model_id, "messages": messages, "max_tokens": max_new_tokens, "temperature": dc_temp}
 
-                    # CRITICAL FIX: Qwen is removed from the blacklist so it correctly utilizes vLLM json_object decoding
                     if force_json and not any(x in model_id.lower() for x in ["deepseek", "command-r"]):
                         payload["response_format"] = {"type": "json_object"}
 
@@ -701,4 +775,4 @@ class ResearchTools:
         safe_prompt = f"{sys_msg}\n\n{prompt}"
         return await loop.run_in_executor(self.thread_pool, functools.partial(self._generate_content_cascade, "FLASH", safe_prompt, force_json=force_json, **kwargs))
 
-print("✅ deepcollector/tools/research.py LOADED (V289: Safe Markdown Extraction & Structure Normalization)")
+print("✅ deepcollector/tools/research.py LOADED (V290: Prompts Hardened & Regex Rescue Restored)")
