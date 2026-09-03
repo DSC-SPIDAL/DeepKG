@@ -1,5 +1,5 @@
 # =============================================================================
-# V296: Research Tools (Token Starvation Override, EOF Healing & Anti-Deadlock)
+# V305: Research Tools (No Silent Exits, Aggressive Truncation Recovery)
 # =============================================================================
 import os
 import requests
@@ -73,6 +73,7 @@ class MockResponseWrapper:
 class ResearchTools:
     MAX_FETCH_LENGTH = 1000000
     MAX_PDF_PAGES = 50
+    PROMPT_TRUNCATION_LIMIT = 50000
 
     def __init__(self, config: Any, keys: Any, models: Any):
         self.config = config
@@ -117,7 +118,9 @@ class ResearchTools:
             else: self.slow_strikes[t_model_str] = 0
 
     def _safe_sync_call(self, func, timeout_sec, *args, **kwargs):
-        """Anti-Deadlock Kill Switch for TCP network hangs."""
+        if timeout_sec is None or timeout_sec <= 0:
+            return func(*args, **kwargs)
+            
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         future = executor.submit(func, *args, **kwargs)
         try:
@@ -129,13 +132,10 @@ class ResearchTools:
 
     @profiler.track("Tool: Web Fetching")
     def _fetch_page_content(self, url: str, timeout=15, minimal_cleaning=False) -> str:
-        return self._fetch_page_content_impl(url, timeout, minimal_cleaning)
+        result = self._fetch_page_content_impl(url, timeout, minimal_cleaning)
+        return result[:self.MAX_FETCH_LENGTH] if result else ""
 
     def _fetch_page_content_impl(self, url: str, timeout=15, minimal_cleaning=False) -> str:
-        def truncate(text):
-            if len(text) > self.MAX_FETCH_LENGTH: return text[:self.MAX_FETCH_LENGTH] + "... [TRUNCATED]"
-            return text
-
         if url.startswith('/content/drive/') or url.startswith('~'):
             try:
                 if os.environ.get("BENCHMARK_MODE") == "LOCAL" and ("PDFGems" in url or "/content/drive/" in url):
@@ -155,7 +155,7 @@ class ResearchTools:
                             raw_url = f"https://raw.githubusercontent.com/{user}/{repo}/{branch}/README.md"
                             try:
                                 response = requests.get(raw_url, headers=HEADERS, timeout=5)
-                                if response.status_code == 200: return truncate(response.text)
+                                if response.status_code == 200: return response.text[:self.MAX_FETCH_LENGTH]
                             except Exception: pass
                 except Exception: pass
 
@@ -195,10 +195,15 @@ class ResearchTools:
                         text = ' '.join([elem.get_text(strip=True, separator=' ') for elem in elements])
                         if len(text.split()) < 50: text = soup.get_text(strip=True, separator=' ')
                 except Exception: text = content.decode('utf-8', errors='ignore')
+                finally:
+                    if 'soup' in locals(): del soup
+                    if 'elements' in locals(): del elements
 
         if text is None: text = ""
         if not minimal_cleaning: text = re.sub(r'\s+', ' ', text).strip()
-        return truncate(text)
+        
+        if 'content' in locals(): del content
+        return text[:self.MAX_FETCH_LENGTH]
 
     def tool_pre_flight_crawl(self, text: str, max_links: int = 5) -> List[str]:
         if not text: return []
@@ -224,6 +229,8 @@ class ResearchTools:
                 urls = [u for u in urls if isinstance(u, str) and u.startswith('http')]
                 return urls[:max_links]
         except Exception: pass
+        finally:
+            gc.collect() 
         return []
 
     @profiler.track("Tool: Gemini Search")
@@ -312,6 +319,8 @@ class ResearchTools:
                 else:
                     if current_idx < len(pool) - 1: continue
                     return []
+            finally:
+                gc.collect() 
         return []
 
     def _simplify_query(self, query):
@@ -322,7 +331,6 @@ class ResearchTools:
         return query.strip()
 
     def _shielded_json_wrap(self, raw_text: str, prompt: str) -> str:
-        """Forces valid JSON. If extraction fails due to truncation, gracefully packs text into rationale."""
         extracted = self._extract_json_robustly(raw_text)
         
         if not extracted or (isinstance(extracted, list) and len(extracted) == 0):
@@ -376,7 +384,6 @@ class ResearchTools:
                 if isinstance(result[first_key], dict) and ("Schema" in first_key or "Oracle" in first_key or "result" in first_key.lower()):
                     result = result[first_key]
             
-            # Ensure the parent script never crashes from missing keys
             if isinstance(result, dict) and ("value" in result or "confidence" in result):
                 if "value" not in result: result["value"] = "[missing]"
                 if "confidence" not in result: result["confidence"] = 0.0
@@ -397,9 +404,6 @@ class ResearchTools:
             return result
         except Exception: pass
 
-        # =========================================================================
-        # V296: AUTO-HEAL REGEX EXTRACTION (Handles Severe Token Truncation)
-        # =========================================================================
         result = {}
         def extract_field(key_name, stop_keys, text_target):
             pattern = rf'(?:["\']|\*\*?)?{key_name}(?:["\']|\*\*?)?\s*[:=]\s*'
@@ -424,7 +428,6 @@ class ResearchTools:
 
             val = text_target[start_pos:end_pos].strip()
             
-            # Auto-Repair: Cap broken string quotes caused by token truncation
             if val.startswith('"') and not val.endswith('"') and '\n' not in val: val += '"'
             if val.startswith("'") and not val.endswith("'") and '\n' not in val: val += "'"
 
@@ -440,29 +443,25 @@ class ResearchTools:
 
         lower_text = clean_text.lower()
         
-        # 1. Check for CellExtractionSchema
         if any(k in lower_text for k in ["value", "confidence", "rationale", "missing"]) and "dataset_name" not in lower_text and "queries" not in lower_text:
             v = extract_field("value", ["confidence", "rationale"], clean_text)
             c = extract_field("confidence", ["value", "rationale"], clean_text)
             r = extract_field("rationale", ["value", "confidence"], clean_text)
 
-            # Even if heavily truncated by the API, salvage what we caught
             if v is not None: result['value'] = v
             if c is not None:
                 try: result['confidence'] = float(re.search(r'[\d\.]+', str(c)).group())
                 except Exception: result['confidence'] = 0.0
             if r is not None: result['rationale'] = r
             
-            # Auto-fill missing pieces to satisfy schema completely so it doesn't break parent
             if result or v is not None or c is not None or r is not None:
                 if "value" not in result: result["value"] = "[missing]"
                 if "confidence" not in result: result["confidence"] = 0.0
                 if "rationale" not in result: result["rationale"] = "Output was truncated by API"
                 return result
             
-        # 2. Check for Search Queries Schema
         if "queries" in lower_text:
-            arr_match = re.search(r'\[(.*)', clean_text, re.DOTALL) # Match even without closing brace
+            arr_match = re.search(r'\[(.*)', clean_text, re.DOTALL)
             if arr_match:
                 items = re.findall(r'[\x22\x27](.*?)[\x22\x27]', arr_match.group(1))
                 if items: return {"queries": items}
@@ -474,7 +473,6 @@ class ResearchTools:
                 
             if '{"queries":' in lower_text: return {"queries": []}
 
-        # 3. Check for Discovery Catalog Schema
         if "discovered_datasets" in lower_text or "dataset_name" in lower_text:
             datasets = []
             blocks = re.findall(r'\{[^{}]*dataset_name[^{}]*\}', clean_text, re.IGNORECASE | re.DOTALL)
@@ -498,9 +496,6 @@ class ResearchTools:
         if "not mention" in lower_text or "not specif" in lower_text or "not found" in lower_text or "does not contain" in lower_text:
             return {"value": "[missing]", "confidence": 0.0, "rationale": "Inferred from conversational refusal"}
 
-        # =========================================================================
-        # 🚨 ERROR LOGGER: Writes to Console + Drive
-        # =========================================================================
         error_msg = f"\n\n{'='*80}\n🚨 JSON FATAL ERROR (Captured for Debugging) 🚨\nRAW TEXT:\n{original_raw_text}\n{'='*80}\n"
         
         if hasattr(self, '_error_print_count') and getattr(self, '_error_print_count', 0) < 5:
@@ -545,12 +540,16 @@ class ResearchTools:
                             return [{"url": url, "content": text, "title": f"ArXiv Paper {paper_id}", "type": "Direct Load"}]
                 except Exception as e:
                     if self.verbosity >= 1: print(f"   ⚠️ ArXiv direct pull error: {e}")
+                finally:
+                    gc.collect()
 
         try:
             content = self._fetch_page_content(url)
             if content and len(content.split()) >= 15:
                 return [{"url": url, "content": content, "title": f"Direct Load: {url[:50]}", "type": "Direct Load"}]
         except Exception: pass
+        finally:
+            gc.collect() 
         return []
 
     def tool_inspect_data_file(self, url: str, ddi_tool: Any = None) -> Dict:
@@ -573,25 +572,28 @@ class ResearchTools:
             "NEVER write conversational sentences. NEVER apologize. ONLY return the JSON block."
         )
 
+        safe_prompt = prompt[:self.PROMPT_TRUNCATION_LIMIT]
+
         if is_vllm:
             import openai
             api_start = time.time()
             model_id = os.environ.get("LOCAL_MODEL_ID", "google/gemma-4-31b-it")
             model_name_label = f"vLLM ({model_id})"
-            class MockResponseWrapper:
-                def __init__(self, text): self.text = text
-            client = openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY", "sk-vllm-dummy-key"), base_url=os.environ.get("OPENAI_API_BASE", "http://localhost:8000/v1"), max_retries=0, timeout=1200.0)
+            
+            timeout_val = 900.0 if "deepseek" in model_id.lower() or "r1" in model_id.lower() else 120.0
+            client = openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY", "sk-vllm-dummy-key"), base_url=os.environ.get("OPENAI_API_BASE", "http://localhost:8000/v1"), max_retries=0, timeout=timeout_val)
             dc_temp = float(os.environ.get("DC_TEMP", "0.0"))
             
-            # 🔥 V296: Token Expansion Floor protects against user-configured token starvation
             dc_tokens = int(os.environ.get("DC_TOKENS", "4096"))
             req_new = kwargs.get("max_new_tokens", dc_tokens)
             force_json = kwargs.get("force_json", False)
-            max_new_tokens = max(int(req_new), 1024) if force_json else int(req_new)
             
-            current_prompt = prompt
+            min_tokens = 8192 if "deepseek" in model_id.lower() or "r1" in model_id.lower() else 1024
+            max_new_tokens = max(int(req_new), min_tokens) if force_json else int(req_new)
 
-            for attempt in range(3):
+            current_prompt = safe_prompt
+
+            for attempt in range(5):
                 try:
                     if any(x in model_id.lower() for x in ["gemma-2", "deepseek", "qwen", "llama", "command-r"]):
                         messages = [{"role": "user", "content": sys_msg + "\n\n" + current_prompt}]
@@ -604,40 +606,51 @@ class ResearchTools:
                         payload["response_format"] = {"type": "json_object"}
 
                     try:
-                        response = self._safe_sync_call(client.chat.completions.create, 120.0, **payload)
+                        response = self._safe_sync_call(client.chat.completions.create, timeout_val, **payload)
                     except Exception as api_err:
                         if "format" in str(api_err).lower() or "json" in str(api_err).lower() or "400" in str(api_err).lower():
                             payload.pop("response_format", None)
-                            response = self._safe_sync_call(client.chat.completions.create, 120.0, **payload)
+                            response = self._safe_sync_call(client.chat.completions.create, timeout_val, **payload)
                         else: raise api_err
 
                     if hasattr(self, '_record_timing'): self._record_timing(model_name_label, time.time() - api_start, model_name_label)
                     raw_res = response.choices[0].message.content
                     
-                    if force_json: return MockResponseWrapper(self._shielded_json_wrap(raw_res, current_prompt))
+                    if force_json: 
+                        ret_wrap = MockResponseWrapper(self._shielded_json_wrap(raw_res, current_prompt))
+                    else:
+                        clean_res = re.sub(r'<think>.*?</think>', '', raw_res, flags=re.DOTALL | re.IGNORECASE)
+                        clean_res = clean_res.replace("```json", "").replace("```", "").strip()
+                        ret_wrap = MockResponseWrapper(clean_res)
+                        
+                    del response
+                    del raw_res
+                    gc.collect() 
                     
-                    clean_res = re.sub(r'<think>.*?</think>', '', raw_res, flags=re.DOTALL | re.IGNORECASE)
-                    clean_res = clean_res.replace("```json", "").replace("```", "").strip()
-                    return MockResponseWrapper(clean_res)
+                    return ret_wrap
                 except Exception as e:
                     err_str = str(e).lower()
-                    if "context length" in err_str or "input_tokens" in err_str:
+                    # V305: Aggressive 30% chop to guarantee we bypass vLLM Context Length errors safely
+                    if "context length" in err_str or "input_tokens" in err_str or "maximum context" in err_str or "400" in err_str:
                         inst_idx = current_prompt.rfind("Instructions:")
                         if inst_idx == -1: inst_idx = current_prompt.rfind("Format EXACTLY")
                         if inst_idx != -1:
                             instructions = current_prompt[inst_idx:]
                             body = current_prompt[:inst_idx]
-                            chop_len = int(len(body) * 0.80)
+                            chop_len = int(len(body) * 0.70)
                             current_prompt = body[:chop_len] + "\n\n...[TRUNCATED TO FIT VRAM]...\n\n" + instructions
                         else:
-                            chop_len = int(len(current_prompt) * 0.85)
+                            chop_len = int(len(current_prompt) * 0.70)
                             current_prompt = current_prompt[:chop_len] + "\n\n...[TRUNCATED TO FIT VRAM]..."
                         continue
-                    if attempt == 2:
-                        if os.environ.get("ABORT_ON_VLLM_FAILURE", "True") == "True": os._exit(1)
-                        else: return self._generate_content_cascade("PRO" if "strategic planner" in prompt else "FLASH", prompt, **kwargs)
+                        
+                    if attempt == 4:
+                        print(f"\n    ❌ [vLLM Error] Local model failed on attempt 5: {str(e)[:200]}")
+                        return MockResponseWrapper(self._shielded_json_wrap("[missing]", current_prompt)) if force_json else MockResponseWrapper("[missing]")
                     time.sleep(2)
-            os._exit(1)
+                    
+            print(f"\n    ❌ [vLLM Error] Failed to shrink prompt enough after 5 attempts.")
+            return MockResponseWrapper(self._shielded_json_wrap("[missing]", current_prompt)) if force_json else MockResponseWrapper("[missing]")
 
         api_start = time.time()
         model_name_label = f"Gemma ({getattr(self.config, 'LLM_BACKEND', 'LOCAL')})"
@@ -647,16 +660,17 @@ class ResearchTools:
             inputs = None; outputs = None; out_tokens_list = []
             model = getattr(self.models, 'LOCAL_MODEL', None)
             tokenizer = getattr(self.models, 'LOCAL_TOKENIZER', None)
-            if not model or not tokenizer or isinstance(model, str): return self._generate_content_cascade("PRO" if "strategic planner" in prompt else "FLASH", prompt, **kwargs)
-            chat = [{"role": "user", "content": sys_msg + "\n\n" + prompt}]
+            if not model or not tokenizer or isinstance(model, str): return self._generate_content_cascade("PRO" if "strategic planner" in prompt else "FLASH", safe_prompt, **kwargs)
+            chat = [{"role": "user", "content": sys_msg + "\n\n" + safe_prompt}]
             try: formatted_prompt = tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
-            except Exception: formatted_prompt = f"<bos><start_of_turn>user\n{sys_msg}\n\n{prompt}<end_of_turn>\n<start_of_turn>model\n"
+            except Exception: formatted_prompt = f"<bos><start_of_turn>user\n{sys_msg}\n\n{safe_prompt}<end_of_turn>\n<start_of_turn>model\n"
             current_max_len = 32000
             
-            # 🔥 V296: Token Expansion Floor
             force_json = kwargs.get("force_json", False)
             passed_tokens = int(kwargs.get("max_new_tokens", 1024))
-            req_max_new = max(passed_tokens, 1024) if force_json else passed_tokens
+            model_id_hf = os.environ.get("LOCAL_MODEL_ID", "")
+            min_tokens = 8192 if "deepseek" in model_id_hf.lower() or "r1" in model_id_hf.lower() else 1024
+            req_max_new = max(passed_tokens, min_tokens) if force_json else passed_tokens
             
             while current_max_len >= 2000:
                 try:
@@ -691,14 +705,18 @@ class ResearchTools:
                         if hasattr(e, "__traceback__") and e.__traceback__: traceback.clear_frames(e.__traceback__)
                         del e
                         continue
-                    else: return self._generate_content_cascade("PRO" if "strategic planner" in prompt else "FLASH", prompt, **kwargs)
-            if not out_tokens_list: return self._generate_content_cascade("PRO" if "strategic planner" in prompt else "FLASH", prompt, **kwargs)
+                    else: return self._generate_content_cascade("PRO" if "strategic planner" in prompt else "FLASH", safe_prompt, **kwargs)
+            if not out_tokens_list: return self._generate_content_cascade("PRO" if "strategic planner" in prompt else "FLASH", safe_prompt, **kwargs)
             response_text = tokenizer.decode(out_tokens_list, skip_special_tokens=True)
-            del prompt
+            
             duration = time.time() - api_start
             self._record_timing(model_name_label, duration, model_name_label)
             
-            if force_json: return MockResponseWrapper(self._shielded_json_wrap(response_text, prompt))
+            if 'inputs' in locals(): del inputs
+            if 'outputs' in locals(): del outputs
+            gc.collect()
+            
+            if force_json: return MockResponseWrapper(self._shielded_json_wrap(response_text, safe_prompt))
             return MockResponseWrapper(response_text.replace("```json", "").replace("```", "").strip())
 
     def _generate_content_cascade(self, pool_name: str, prompt: str, **kwargs):
@@ -708,7 +726,6 @@ class ResearchTools:
         max_tokens = kwargs.pop("max_new_tokens", None)
         base_config = kwargs.pop("config", None)
         
-        # Stop sequences are wiped to prevent the parent script from artificially truncating the model!
         for k in ["do_sample", "temperature", "top_p", "top_k", "repetition_penalty", "return_dict_in_generate", "output_scores", "stop"]: kwargs.pop(k, None)
         
         sys_msg = "You are a strict data extraction AI. You MUST output ONLY valid JSON format without markdown code blocks."
@@ -721,13 +738,11 @@ class ResearchTools:
             if types:
                 current_config = types.GenerateContentConfig()
                 if base_config:
-                    # Disable buggy Google Constrained Decoding Engine entirely!
                     for attr in ['candidate_count', 'max_output_tokens', 'stop_sequences', 'response_mime_type', 'tools', 'system_instruction']:
                         if hasattr(base_config, attr) and getattr(base_config, attr) is not None: 
-                            if attr == 'response_schema': continue # Stripped!
+                            if attr == 'response_schema': continue 
                             setattr(current_config, attr, getattr(base_config, attr))
                             
-                # 🔥 V296: Intercept Google Cloud token limits. Force to 1024 so JSON arrays aren't aborted mid-stream
                 if max_tokens:
                     safe_max = max(int(max_tokens), 1024) if force_json else int(max_tokens)
                     current_config.max_output_tokens = safe_max
@@ -758,13 +773,10 @@ class ResearchTools:
                 self._record_timing(target_model_str, duration, target_model_str)
                 
                 if force_json and hasattr(response, 'text'):
-                    class MockResponse:
-                        def __init__(self, text, orig):
-                            self.text = text
-                            self.original = orig
-                            if hasattr(orig, 'candidates'): self.candidates = orig.candidates
-                            if hasattr(orig, 'prompt_feedback'): self.prompt_feedback = orig.prompt_feedback
-                    return MockResponse(self._shielded_json_wrap(response.text if response.text else "", prompt), response)
+                    ret_wrap = MockResponseWrapper(self._shielded_json_wrap(response.text if response.text else "", prompt))
+                    del response
+                    gc.collect() 
+                    return ret_wrap
                     
                 return response
             except Exception as e:
@@ -783,6 +795,8 @@ class ResearchTools:
                         if self.verbosity >= 1: print(f"    ➡️ Unrecognized error. Safety cascade to next model: {pool[current_idx+1]}")
                         continue
                     raise e
+            finally:
+                gc.collect() 
         raise ResourceWarning(f"All models in {pool_name} pool exhausted.")
 
     @profiler.track("LLM: Planner")
@@ -819,10 +833,12 @@ class ResearchTools:
         is_local = getattr(self.config, 'LLM_BACKEND', '') in ["LOCAL_PRO", "LOCAL_CLASSROOM"]
         use_vllm = getattr(self.config, 'USE_vLLM', False) or os.environ.get("DEEPCOLLECTOR_USE_VLLM", "False") == "True"
         
-        # 🔥 V296: Intercept upstream max_tokens args so the asyncio LLMs aren't decapitated.
         force_json = kwargs.pop("force_json", True)
         passed_t = int(kwargs.pop("max_new_tokens", 512))
-        max_t = max(passed_t, 1024) if force_json else passed_t
+        
+        model_id_env = os.environ.get("LOCAL_MODEL_ID", "")
+        min_tokens = 8192 if "deepseek" in model_id_env.lower() or "r1" in model_id_env.lower() else 1024
+        max_t = max(passed_t, min_tokens) if force_json else passed_t
         
         for bad_k in ["do_sample", "temperature", "top_p", "top_k", "repetition_penalty", "return_dict_in_generate", "output_scores", "stop", "config", "force_json"]: kwargs.pop(bad_k, None)
 
@@ -837,56 +853,87 @@ class ResearchTools:
         class MockResp:
             def __init__(self, text): self.text = text
         api_start = time.time()
+        
+        safe_prompt = prompt[:self.PROMPT_TRUNCATION_LIMIT]
 
         if is_local and use_vllm:
             import openai
-            client = openai.AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY", "sk-vllm-dummy-key"), base_url=os.environ.get("OPENAI_API_BASE", "http://localhost:8000/v1"), max_retries=0, timeout=180.0)
+            
+            timeout_val = 900.0 if "deepseek" in os.environ.get("LOCAL_MODEL_ID", "").lower() or "r1" in os.environ.get("LOCAL_MODEL_ID", "").lower() else 120.0
+            
+            client = openai.AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY", "sk-vllm-dummy-key"), base_url=os.environ.get("OPENAI_API_BASE", "http://localhost:8000/v1"), max_retries=0, timeout=timeout_val)
             model_id = os.environ.get("LOCAL_MODEL_ID", "google/gemma-4-31b-it")
             dc_temp = float(os.environ.get("DC_TEMP", "0.0"))
 
-            for attempt in range(3):
+            current_prompt = safe_prompt
+
+            for attempt in range(5):
                 try:
-                    if any(x in model_id.lower() for x in ["gemma-2", "deepseek"]): messages = [{"role": "user", "content": sys_msg + "\n\n" + prompt}]
-                    else: messages = [{"role": "system", "content": sys_msg}, {"role": "user", "content": prompt}]
+                    if any(x in model_id.lower() for x in ["gemma-2", "deepseek"]): messages = [{"role": "user", "content": sys_msg + "\n\n" + current_prompt}]
+                    else: messages = [{"role": "system", "content": sys_msg}, {"role": "user", "content": current_prompt}]
                     
                     payload = {"model": model_id, "messages": messages, "max_tokens": max_t, "temperature": dc_temp}
                     if force_json and not any(x in model_id.lower() for x in ["deepseek", "command-r"]): payload["response_format"] = {"type": "json_object"}
                     
-                    try: resp = await asyncio.wait_for(client.chat.completions.create(**payload), timeout=120.0)
+                    try: resp = await asyncio.wait_for(client.chat.completions.create(**payload), timeout=timeout_val)
                     except Exception as api_err:
                         if "format" in str(api_err).lower() or "json" in str(api_err).lower() or "400" in str(api_err).lower():
                             payload.pop("response_format", None)
-                            resp = await asyncio.wait_for(client.chat.completions.create(**payload), timeout=120.0)
+                            resp = await asyncio.wait_for(client.chat.completions.create(**payload), timeout=timeout_val)
                         else: raise api_err
                         
                     self._record_timing(f"vLLM ({model_id})", time.time() - api_start, f"vLLM ({model_id})")
                     raw_res = resp.choices[0].message.content
-                    if force_json: return MockResp(self._shielded_json_wrap(raw_res, prompt))
-                    clean_res = re.sub(r'<think>.*?</think>', '', raw_res, flags=re.DOTALL | re.IGNORECASE)
-                    return MockResp(clean_res.replace("```json", "").replace("```", "").strip())
+                    if force_json: 
+                        ret_wrap = MockResp(self._shielded_json_wrap(raw_res, current_prompt))
+                    else:
+                        clean_res = re.sub(r'<think>.*?</think>', '', raw_res, flags=re.DOTALL | re.IGNORECASE)
+                        ret_wrap = MockResp(clean_res.replace("```json", "").replace("```", "").strip())
+                        
+                    del resp
+                    del raw_res
+                    gc.collect()
+                    
+                    return ret_wrap
                 except Exception as e:
-                    if "context length" in str(e).lower() or "input_tokens" in str(e).lower():
-                        inst_idx = prompt.rfind("Instructions:")
-                        if inst_idx == -1: inst_idx = prompt.rfind("Format EXACTLY")
+                    err_str = str(e).lower()
+                    if "context length" in err_str or "input_tokens" in err_str or "maximum context" in err_str or "400" in err_str:
+                        inst_idx = current_prompt.rfind("Instructions:")
+                        if inst_idx == -1: inst_idx = current_prompt.rfind("Format EXACTLY")
                         if inst_idx != -1:
-                            prompt = prompt[:int(len(prompt[:inst_idx]) * 0.80)] + "\n\n...[TRUNCATED]...\n\n" + prompt[inst_idx:]
-                        else: prompt = prompt[:int(len(prompt)*0.85)] + "\n\n...[TRUNCATED]..."
+                            instructions = current_prompt[inst_idx:]
+                            body = current_prompt[:inst_idx]
+                            chop_len = int(len(body) * 0.70)
+                            current_prompt = body[:chop_len] + "\n\n...[TRUNCATED TO FIT VRAM]...\n\n" + instructions
+                        else:
+                            chop_len = int(len(current_prompt) * 0.70)
+                            current_prompt = current_prompt[:chop_len] + "\n\n...[TRUNCATED TO FIT VRAM]..."
                         continue
-                    if attempt == 2: return MockResp(self._shielded_json_wrap("[missing]", prompt)) if force_json else MockResp("[missing]")
+                        
+                    if attempt == 4:
+                        print(f"\n    ❌ [vLLM Async Error] Local model failed on attempt 5: {str(e)[:200]}")
+                        return MockResp(self._shielded_json_wrap("[missing]", current_prompt)) if force_json else MockResp("[missing]")
                     await asyncio.sleep(2)
+                finally:
+                    gc.collect() 
+            
+            print(f"\n    ❌ [vLLM Async Error] Failed to shrink prompt enough after 5 attempts.")
+            return MockResp(self._shielded_json_wrap("[missing]", current_prompt)) if force_json else MockResp("[missing]")
 
         elif provider == "OPENAI":
             import openai
             client = openai.AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"], timeout=180.0)
             for attempt in range(4):
                 try:
-                    payload = {"model": model, "messages": [{"role": "system", "content": sys_msg}, {"role": "user", "content": prompt}], "temperature": 0.0, "max_tokens": max_t}
+                    payload = {"model": model, "messages": [{"role": "system", "content": sys_msg}, {"role": "user", "content": safe_prompt}], "temperature": 0.0, "max_tokens": max_t}
                     if force_json: payload["response_format"] = {"type": "json_object"}
-                    if "sol" in model.lower() or "-o" in model.lower(): payload = {"model": model, "messages": [{"role": "user", "content": f"{sys_msg}\n\n{prompt}"}]}
+                    if "sol" in model.lower() or "-o" in model.lower(): payload = {"model": model, "messages": [{"role": "user", "content": f"{sys_msg}\n\n{safe_prompt}"}]}
                     resp = await asyncio.wait_for(client.chat.completions.create(**payload), timeout=120.0)
                     self._record_timing(model, time.time() - api_start, model)
                     raw_res = resp.choices[0].message.content
-                    if force_json: return MockResp(self._shielded_json_wrap(raw_res, prompt))
+                    del resp
+                    gc.collect()
+                    if force_json: return MockResp(self._shielded_json_wrap(raw_res, safe_prompt))
                     return MockResp(raw_res.replace("```json", "").replace("```", "").strip())
                 except Exception as e:
                     if "429" in str(e).lower() or "quota" in str(e).lower(): await asyncio.sleep((2**attempt)*3 + 2); continue
@@ -897,10 +944,12 @@ class ResearchTools:
             client = anthropic.AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"], timeout=180.0)
             for attempt in range(4):
                 try:
-                    resp = await asyncio.wait_for(client.messages.create(model=model, system=sys_msg, messages=[{"role": "user", "content": prompt}], max_tokens=max_t), timeout=120.0)
+                    resp = await asyncio.wait_for(client.messages.create(model=model, system=sys_msg, messages=[{"role": "user", "content": safe_prompt}], max_tokens=max_t), timeout=120.0)
                     self._record_timing(model, time.time() - api_start, model)
                     raw_res = next((block.text for block in resp.content if getattr(block, "type", "") == "text"), "")
-                    if force_json: return MockResp(self._shielded_json_wrap(raw_res, prompt))
+                    del resp
+                    gc.collect()
+                    if force_json: return MockResp(self._shielded_json_wrap(raw_res, safe_prompt))
                     return MockResp(raw_res.replace("```json", "").replace("```", "").strip())
                 except Exception as e:
                     if "429" in str(e).lower() or "overloaded" in str(e).lower(): await asyncio.sleep((2**attempt)*3 + 2); continue
@@ -913,7 +962,7 @@ class ResearchTools:
             kwargs["config"] = cfg
 
         loop = asyncio.get_running_loop()
-        safe_prompt = f"{sys_msg}\n\n{prompt}"
-        return await loop.run_in_executor(self.thread_pool, functools.partial(self._generate_content_cascade, "FLASH", safe_prompt, force_json=force_json, **kwargs))
+        safe_str = f"{sys_msg}\n\n{safe_prompt}"
+        return await loop.run_in_executor(self.thread_pool, functools.partial(self._generate_content_cascade, "FLASH", safe_str, force_json=force_json, **kwargs))
 
-print("✅ deepcollector/tools/research.py LOADED (V296: Token Starvation Overrides Active)")
+print("✅ deepcollector/tools/research.py LOADED (V305: Safe vLLM Error Handling & Truncation Recovery)")
