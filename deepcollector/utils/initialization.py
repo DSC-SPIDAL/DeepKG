@@ -1,5 +1,5 @@
 # =============================================================================
-# V187: Initialization (Dynamic Target Model Injection & Robust Native Embeddings)
+# V188: Initialization (Explicit Split-Brain Model Injection)
 # =============================================================================
 import os
 import sys
@@ -167,19 +167,33 @@ def initialize_apis(config: Any) -> Tuple[Dict[str, str], Any]:
         from google import genai
         client = genai.Client(api_key=api_key)
 
+        # 🧠 FIX: Check for explicit Split-Brain Model environment variables
         target_model = os.environ.get("TARGET_MODEL", "")
+        target_pro = os.environ.get("TARGET_PRO_MODEL", "")
+        target_flash = os.environ.get("TARGET_FLASH_MODEL", "")
+
         candidates_pro = ["gemini-3.1-pro-preview", "gemini-2.5-pro"]
         candidates_flash = ["gemini-3.5-flash", "gemini-2.5-flash"]
 
-        # Dynamically inject targeted models from environment
-        if target_model and "gemini" in target_model.lower():
+        # Dynamically inject targeted PRO models
+        if target_pro and "gemini" in target_pro.lower():
+            clean_pro = target_pro.strip()
+            if clean_pro not in candidates_pro:
+                candidates_pro.insert(0, clean_pro)
+        elif target_model and "gemini" in target_model.lower() and "pro" in target_model.lower():
             clean_target = target_model.strip()
-            if "pro" in clean_target:
-                if clean_target not in candidates_pro:
-                    candidates_pro.insert(0, clean_target)
-            else:
-                if clean_target not in candidates_flash:
-                    candidates_flash.insert(0, clean_target)
+            if clean_target not in candidates_pro:
+                candidates_pro.insert(0, clean_target)
+
+        # Dynamically inject targeted FLASH models
+        if target_flash and "gemini" in target_flash.lower():
+            clean_flash = target_flash.strip()
+            if clean_flash not in candidates_flash:
+                candidates_flash.insert(0, clean_flash)
+        elif target_model and "gemini" in target_model.lower() and "flash" in target_model.lower():
+            clean_target = target_model.strip()
+            if clean_target not in candidates_flash:
+                candidates_flash.insert(0, clean_target)
 
         def verify_pool(model_list, pool_name):
             verified = []
@@ -234,7 +248,7 @@ def initialize_apis(config: Any) -> Tuple[Dict[str, str], Any]:
             MODEL_RAG_PRIMARY = verified_flash[0]
 
         print(f"    ✅ Gemini Client initialized.")
-        print(f"    🎭 Active Roles:")
+        print(f"    🎭 Active Split-Brain Roles:")
         print(f"       - Planner/Search: {Models.MODEL_PLANNER}")
         print(f"       - RAG Extraction: {Models.MODEL_RAG_PRIMARY}")
 

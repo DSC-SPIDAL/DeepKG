@@ -42,7 +42,15 @@ trap 'cleanup; exit 130' INT TERM
 trap cleanup EXIT
 
 cd /home/geoffrey/Desktop/DeepKG || exit 1
-if [ -f ".env" ]; then source .env; else exit 1; fi
+
+# 🔥 CRITICAL FIX: 'set -a' forces ALL variables in .env to be exported to Python!
+if [ -f ".env" ]; then 
+    set -a
+    source .env
+    set +a
+else 
+    exit 1
+fi
 
 export KB_SHEET_ID="1-PuWrHO30E4WPM-rOed03n42gfo5AlEtscKqqtjznA0"
 export PROJECT_LIST_ID="1gJ6oHZj0NzCHNOeFNyJTBTtlmS0b7gBSHF3iOqJrFwE"
@@ -53,9 +61,11 @@ rm -rf /dev/shm/vllm* /dev/shm/nccl* /dev/shm/core* 2>/dev/null
 
 if [ "$BENCHMARK_MODE" == "LOCAL" ]; then
     DOCKER_ARGS=(--model "$LOCAL_MODEL_ID" --tensor-parallel-size "$TP_SIZE" --max-model-len "$LOCAL_MAX_CONTEXT" --enable-prefix-caching --gpu-memory-utilization 0.95 --trust-remote-code --enforce-eager)
+    
     if [ "$MODEL_CHOICE" == "gemma2" ]; then DOCKER_ARGS+=( --rope-scaling '{"type":"dynamic","factor":16.0}' ); fi
 
     echo "🧠 Starting vLLM ($LOCAL_MODEL_ID) | Context: $LOCAL_MAX_CONTEXT | Concurrency: $VLLM_CONCURRENCY | TP: $TP_SIZE..."
+    
     docker run -e VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 -d --name vllm_engine --gpus all --shm-size 32g -e NVIDIA_VISIBLE_DEVICES="0,1,2,4" -e HF_TOKEN="$HF_TOKEN" -v /raid/huggingface_cache:/root/.cache/huggingface -p 8000:8000 --ipc=host vllm/vllm-openai:latest "${DOCKER_ARGS[@]}" > /dev/null
 
     echo -n "⏳ Waiting for vLLM to load weights "
@@ -77,5 +87,5 @@ LOG_FILE="${TARGET_PROJECT}_${MODEL_CHOICE}_Ctx${LOCAL_MAX_CONTEXT}_Con${VLLM_CO
 
 echo "🚀 Starting DeepCollector Benchmark (Saving output to $LOG_FILE)..."
 
-# 🔥 CRITICAL FIX: PYTHONPATH forces the DGX to load the files you just edited!
+# PYTHONPATH injection guarantees your local code edits run
 PYTHONPATH="$(pwd)" PYTHONUNBUFFERED=1 python3 run_agent.py 2>&1 | tee "$LOG_FILE"

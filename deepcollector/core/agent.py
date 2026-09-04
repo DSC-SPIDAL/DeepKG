@@ -1,5 +1,5 @@
 # =============================================================================
-# V209: CatalogAgent (Strict CSV Folder Export & Clean Naming Convention)
+# V210: CatalogAgent (Dynamic RAG Model Telemetry Attribution Fix)
 # =============================================================================
 import pandas as pd
 import time
@@ -52,6 +52,7 @@ except ImportError as e:
     PerformanceAnalyzer = object
     profiler_module = None
     ProjectMerger = None
+
 
 class AdvancedKnowledgeProcessor:
     def __init__(self, doc_url: str, tools: Any, target_project_name: str = None):
@@ -150,8 +151,9 @@ class AdvancedKnowledgeProcessor:
                     "Augmented Description": aug_desc
                 })
 
+
 class CatalogAgent:
-    VERSION = "V209"
+    VERSION = "V210"
 
     def __init__(self, config: AppConfig, authenticated_gc: Any, keys: Any = None, models: Any = None):
         self.config = config
@@ -216,6 +218,23 @@ class CatalogAgent:
         self.GROUNDING_FIELDS = getattr(config, 'GROUNDING_FIELDS', [])
         self.EXTRACTED_FIELDS = getattr(config, 'EXTRACTED_FIELDS', [])
         self.DATA_INSPECTION_ENABLED = getattr(config, 'DATA_INSPECTION_ENABLED', True)
+
+    @property
+    def extraction_model_name(self) -> str:
+        """
+        Dynamically returns the actual RAG/Extraction model being used.
+        Prevents misattributing Flash's hard work to the Pro planning model in Cloud runs.
+        """
+        benchmark_mode = getattr(self.config, 'BENCHMARK_MODE', os.environ.get("BENCHMARK_MODE", ""))
+        
+        if benchmark_mode == "LOCAL":
+            return os.environ.get("LOCAL_MODEL_ID", os.environ.get("TARGET_MODEL", getattr(self.config, "PROFILE_NAME", "Unknown")))
+            
+        # Cloud Mode (Split-Brain Architecture)
+        if hasattr(self, 'models') and self.models and hasattr(self.models, 'MODEL_RAG_PRIMARY'):
+            return str(self.models.MODEL_RAG_PRIMARY).replace("models/", "")
+            
+        return os.environ.get("TARGET_MODEL", "Unknown")
 
     @staticmethod
     def _track(category):
@@ -309,12 +328,8 @@ class CatalogAgent:
                         print(" 🐞 JSON FORMATTING FAILURE AUDIT (Chatty Model Bias)")
                         print("="*80)
                         
-                        model_cfg = os.environ.get("TARGET_MODEL", getattr(self.config, "PROFILE_NAME", "Unknown"))
-                        if os.environ.get("BENCHMARK_MODE") == "LOCAL":
-                            model_cfg = os.environ.get("LOCAL_MODEL_ID", model_cfg)
-                        
                         stats = [{
-                            "Model_Config": model_cfg,
+                            "Model_Config": self.extraction_model_name,
                             "Total_Cells_Attempted": self.state.json_attempts,
                             "JSON_Parse_Errors": self.state.json_parse_errors,
                             "Error_Rate (%)": f"{err_rate:.1f}"
@@ -349,6 +364,9 @@ class CatalogAgent:
                         pass
 
                 if self.kb_manager.is_connected:
+                    op_report = self.config.get_operational_report()
+                    op_report["EXTRACTION_MODEL"] = self.extraction_model_name
+                    
                     job_data = {
                         "JobID": self.job_id,
                         "ProjectID": self.config.CURRENT_PROJECT_ID,
@@ -358,7 +376,7 @@ class CatalogAgent:
                         "Duration_Sec": f"{duration:.2f}",
                         "Status": job_status,
                         "Items_Found": len(self.state.catalog),
-                        "Operational_Parameters": self.config.get_operational_report(),
+                        "Operational_Parameters": op_report,
                         "JOB_COMMENT": job_comment
                     }
                     self.kb_manager.log_job_execution(job_data)
@@ -1172,11 +1190,6 @@ class CatalogAgent:
         finally:
             lock.release()
 
-    # =========================================================================
-    # CRITICAL EXPORT OVERRIDE: Strict CSV Export
-    # Replaces standalone Google Sheet creation with a direct Google Drive
-    # API upload to the specified target folder dynamically via AppConfig.
-    # =========================================================================
     def _export_run_data(self):
         print(f"\n{'='*20} RUN EXPORT {'='*20}")
         try:
@@ -1202,12 +1215,12 @@ class CatalogAgent:
             # -------------------------------------------------------------
             import os
             proj_name = str(getattr(self.config, 'CURRENT_PROJECT_NAME', 'UNKNOWN'))
-            hybrid_model_name = os.environ.get("TARGET_MODEL", "Unknown")
+            hybrid_model_name = self.extraction_model_name
             target_run = os.environ.get("TARGET_RUN", "Run1")
             timestamp = time.strftime('%Y%m%d_%H%M')
             safe_proj_name = re.sub(r'[^A-Za-z0-9_\-]', '_', proj_name).strip('_')
             
-            if getattr(self.config, 'BENCHMARK_MODE', ""):
+            if getattr(self.config, 'BENCHMARK_MODE', "") or os.environ.get("BENCHMARK_MODE", ""):
                 df.insert(0, "Project", proj_name)
                 df.insert(1, "Benchmark_Model", hybrid_model_name)
                 filename = f"Bench_{safe_proj_name}_{hybrid_model_name.replace('.','-').replace('@','_')}_{target_run}_{timestamp}.csv"
@@ -1345,5 +1358,3 @@ class CatalogAgent:
             row["Completeness (High Conf %)"] = f"{(high_conf/total)*100:.1f}%" if total else "0%"
             data.append(row)
         return pd.DataFrame(data)
-
-print("✅ deepcollector/core/agent.py written (Strict CSV Folder Export & Clean Naming Convention Fix).")
